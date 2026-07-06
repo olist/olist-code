@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "olist-code"
+version = "2.2.0"
+description = "Olist Code Adapter - Proxy that translates Anthropic Messages API to OpenAI Chat Completions"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "typer>=0.12.0",
+    "fastapi>=0.110.0",
+    "granian>=1.5.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.15.15",
+    "mypy>=2.1.0",
+]
+
+[project.scripts]
+olist-code-adapter = "olist_code.cli:main"
+olist-code = "olist_code.cli:main"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+
+[tool.mypy]
+files = ["olist_code"]
+mypy_path = "olist_code"
+enable_error_code = ["deprecated"]
+enable_incomplete_feature = ["TypeForm"]
+strict = true
+disable_error_code = ["import-untyped", "no-redef"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+strict = false
+disable_error_code = [
+  "import-untyped",
+  "no-untyped-call",
+  "no-untyped-def",
+  "attr-defined",
+  "arg-type",
+  "union-attr",
+  "call-arg",
+  "assignment",
+  "var-annotated",
+  "misc",
+  "type-arg",
+  "index",
+  "func-returns-value",
+  "method-assign",
+  "unused-ignore",
+  "unused-coroutine",
+  "operator",
+  "valid-type",
+  "name-defined",
+  "untyped-decorator",
+  "typeddict-item",
+  "typeddict-unknown-key",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.7",
+    "debugpy>=1.8.21",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
