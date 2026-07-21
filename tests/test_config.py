@@ -89,3 +89,52 @@ class TestUpdateOpencodeSettings:
         data = json.loads(opencode_settings_file.read_text())
         models = data["provider"]["olist-ai-gateway"]["models"]
         assert list(models.keys()) == ["glm-4.6"]
+
+
+class TestRestoreClaudeSettings:
+    def test_noop_when_file_missing(self, claude_settings_file):
+        config.restore_claude_settings()
+        assert not claude_settings_file.exists()
+
+    def test_removes_only_our_keys(self, claude_settings_file):
+        claude_settings_file.parent.mkdir(parents=True)
+        claude_settings_file.write_text(json.dumps({"foo": "bar", "env": {"OTHER": "1"}}))
+
+        config.update_claude_settings(make_config())
+        config.restore_claude_settings()
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["foo"] == "bar"
+        assert data["env"] == {"OTHER": "1"}
+
+    def test_drops_env_key_if_it_becomes_empty(self, claude_settings_file):
+        claude_settings_file.parent.mkdir(parents=True)
+        claude_settings_file.write_text(json.dumps({"foo": "bar"}))
+
+        config.update_claude_settings(make_config())
+        config.restore_claude_settings()
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data == {"foo": "bar"}
+
+
+class TestRestoreOpencodeSettings:
+    def test_noop_when_file_missing(self, opencode_settings_file):
+        config.restore_opencode_settings()
+        assert not opencode_settings_file.exists()
+
+    def test_removes_only_our_provider(self, opencode_settings_file):
+        opencode_settings_file.parent.mkdir(parents=True)
+        opencode_settings_file.write_text(json.dumps({"provider": {"anthropic": {"npm": "@ai-sdk/anthropic"}}}))
+
+        config.update_opencode_settings(make_config())
+        config.restore_opencode_settings()
+
+        data = json.loads(opencode_settings_file.read_text())
+        assert data["provider"] == {"anthropic": {"npm": "@ai-sdk/anthropic"}}
+
+    def test_deletes_file_if_we_created_it(self, opencode_settings_file):
+        config.update_opencode_settings(make_config())
+        config.restore_opencode_settings()
+
+        assert not opencode_settings_file.exists()

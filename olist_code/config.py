@@ -13,6 +13,15 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 OPENCODE_SETTINGS_FILE = Path.home() / ".config" / "opencode" / "opencode.json"
 OPENCODE_PROVIDER_ID = "olist-ai-gateway"
+OPENCODE_SCHEMA_URL = "https://opencode.ai/config.json"
+
+_CLAUDE_ENV_KEYS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
 
 
 def ensure_config_dir() -> None:
@@ -61,6 +70,25 @@ def update_claude_settings(config: AdapterConfig) -> None:
         json.dump(existing, f, indent=2)
 
 
+def restore_claude_settings() -> None:
+    """Undo update_claude_settings(), leaving any other settings untouched."""
+    if not CLAUDE_SETTINGS_FILE.exists():
+        return
+
+    with open(CLAUDE_SETTINGS_FILE) as f:
+        existing: dict[str, Any] = json.load(f)
+
+    env = existing.get("env")
+    if isinstance(env, dict):
+        for key in _CLAUDE_ENV_KEYS:
+            env.pop(key, None)
+        if not env:
+            existing.pop("env", None)
+
+    with open(CLAUDE_SETTINGS_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+
+
 def update_opencode_settings(config: AdapterConfig) -> None:
     OPENCODE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -69,7 +97,7 @@ def update_opencode_settings(config: AdapterConfig) -> None:
         with open(OPENCODE_SETTINGS_FILE) as f:
             existing = json.load(f)
 
-    existing.setdefault("$schema", "https://opencode.ai/config.json")
+    existing.setdefault("$schema", OPENCODE_SCHEMA_URL)
 
     if "provider" not in existing or not isinstance(existing["provider"], dict):
         existing["provider"] = {}
@@ -89,6 +117,28 @@ def update_opencode_settings(config: AdapterConfig) -> None:
         },
         "models": models,
     }
+
+    with open(OPENCODE_SETTINGS_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+
+
+def restore_opencode_settings() -> None:
+    """Undo update_opencode_settings(), leaving any other providers/keys untouched."""
+    if not OPENCODE_SETTINGS_FILE.exists():
+        return
+
+    with open(OPENCODE_SETTINGS_FILE) as f:
+        existing: dict[str, Any] = json.load(f)
+
+    provider = existing.get("provider")
+    if isinstance(provider, dict):
+        provider.pop(OPENCODE_PROVIDER_ID, None)
+        if not provider:
+            existing.pop("provider", None)
+
+    if not existing or existing == {"$schema": OPENCODE_SCHEMA_URL}:
+        OPENCODE_SETTINGS_FILE.unlink()
+        return
 
     with open(OPENCODE_SETTINGS_FILE, "w") as f:
         json.dump(existing, f, indent=2)
