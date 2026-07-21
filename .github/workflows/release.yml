@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: olist-code-linux-x86_64
+          - os: macos-latest
+            asset_name: olist-code-macos-arm64
+          - os: windows-latest
+            asset_name: olist-code-windows-x86_64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --extra build
+
+      - name: Build binary
+        run: uv run pyinstaller --onefile --name olist-code scripts/pyinstaller_entry.py
+
+      - name: Rename artifact (unix)
+        if: runner.os != 'Windows'
+        run: mv dist/olist-code dist/${{ matrix.asset_name }}
+
+      - name: Rename artifact (windows)
+        if: runner.os == 'Windows'
+        run: mv dist/olist-code.exe dist/${{ matrix.asset_name }}
+
+      - name: Smoke test binary (unix)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x dist/${{ matrix.asset_name }}
+          ./dist/${{ matrix.asset_name }} version
+
+      - name: Smoke test binary (windows)
+        if: runner.os == 'Windows'
+        run: .\dist\${{ matrix.asset_name }} version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
