@@ -11,6 +11,8 @@ from .models import AdapterConfig
 CONFIG_DIR = Path.home() / ".olist-code-adapter"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
+OPENCODE_SETTINGS_FILE = Path.home() / ".config" / "opencode" / "opencode.json"
+OPENCODE_PROVIDER_ID = "olist-ai-gateway"
 
 
 def ensure_config_dir() -> None:
@@ -56,6 +58,39 @@ def update_claude_settings(config: AdapterConfig) -> None:
         env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = config.models.haiku
 
     with open(CLAUDE_SETTINGS_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+
+
+def update_opencode_settings(config: AdapterConfig) -> None:
+    OPENCODE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict[str, Any] = {}
+    if OPENCODE_SETTINGS_FILE.exists():
+        with open(OPENCODE_SETTINGS_FILE) as f:
+            existing = json.load(f)
+
+    existing.setdefault("$schema", "https://opencode.ai/config.json")
+
+    if "provider" not in existing or not isinstance(existing["provider"], dict):
+        existing["provider"] = {}
+
+    models: dict[str, Any] = {config.models.opus: {}}
+    if config.models.sonnet:
+        models[config.models.sonnet] = {}
+    if config.models.haiku:
+        models[config.models.haiku] = {}
+
+    existing["provider"][OPENCODE_PROVIDER_ID] = {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "Olist AI Gateway",
+        "options": {
+            "baseURL": f"http://localhost:{config.port}/v1",
+            "apiKey": "default",
+        },
+        "models": models,
+    }
+
+    with open(OPENCODE_SETTINGS_FILE, "w") as f:
         json.dump(existing, f, indent=2)
 
 

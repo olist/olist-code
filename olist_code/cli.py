@@ -21,6 +21,7 @@ from .config import (
     save_config,
     update_claude_json,
     update_claude_settings,
+    update_opencode_settings,
 )
 from .models import AdapterConfig, ModelConfig, SSOConfig
 from .proxy import fetch_gateway_models
@@ -203,6 +204,7 @@ def run(
 
     update_claude_settings(config)
     update_claude_json()
+    update_opencode_settings(config)
 
     from .server import set_app_config
 
@@ -388,6 +390,7 @@ def init():
     save_config(config)
     update_claude_settings(config)
     update_claude_json()
+    update_opencode_settings(config)
 
     next_steps = "  Run [bold]olist-code-adapter run[/bold] to start the proxy."
     if not config.api_key:
