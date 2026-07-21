@@ -191,7 +191,9 @@ def openai_to_anthropic_response(data: OpenAIResponseChunk) -> AnthropicResponse
         return {"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 0, "output_tokens": 0}}
 
     choice = choices[0]
-    delta = choice.get("delta", {})
+    # Non-streaming responses carry the message under "message"; only
+    # streaming chunks use "delta". Prefer whichever is present.
+    delta = choice.get("message") or choice.get("delta") or {}
     finish_reason = choice.get("finish_reason")
 
     stop_reason = "end_turn"
