@@ -37,6 +37,15 @@ def _load_jsonc(path: Path) -> dict[str, Any]:
         return json.loads(_strip_jsonc_comments(f.read()))
 
 
+_CLAUDE_ENV_KEYS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+
+
 def ensure_config_dir() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -83,6 +92,25 @@ def update_claude_settings(config: AdapterConfig) -> None:
         json.dump(existing, f, indent=2)
 
 
+def restore_claude_settings() -> None:
+    """Undo update_claude_settings(), leaving any other settings untouched."""
+    if not CLAUDE_SETTINGS_FILE.exists():
+        return
+
+    with open(CLAUDE_SETTINGS_FILE) as f:
+        existing: dict[str, Any] = json.load(f)
+
+    env = existing.get("env")
+    if isinstance(env, dict):
+        for key in _CLAUDE_ENV_KEYS:
+            env.pop(key, None)
+        if not env:
+            existing.pop("env", None)
+
+    with open(CLAUDE_SETTINGS_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+
+
 def update_opencode_settings(config: AdapterConfig) -> None:
     target = _resolve_opencode_settings_file()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +139,28 @@ def update_opencode_settings(config: AdapterConfig) -> None:
         },
         "models": models,
     }
+
+    with open(target, "w") as f:
+        json.dump(existing, f, indent=2)
+
+
+def restore_opencode_settings() -> None:
+    """Undo update_opencode_settings(), leaving any other providers/keys untouched."""
+    target = _resolve_opencode_settings_file()
+    if not target.exists():
+        return
+
+    existing = _load_jsonc(target)
+
+    provider = existing.get("provider")
+    if isinstance(provider, dict):
+        provider.pop(OPENCODE_PROVIDER_ID, None)
+        if not provider:
+            existing.pop("provider", None)
+
+    if not existing or existing == {"$schema": OPENCODE_SCHEMA_URL}:
+        target.unlink()
+        return
 
     with open(target, "w") as f:
         json.dump(existing, f, indent=2)
