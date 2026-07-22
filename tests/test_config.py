@@ -33,7 +33,13 @@ def claude_settings_file(tmp_path, monkeypatch):
 def opencode_settings_file(tmp_path, monkeypatch):
     path = tmp_path / ".config" / "opencode" / "opencode.json"
     monkeypatch.setattr(config, "OPENCODE_SETTINGS_FILE", path)
+    monkeypatch.setattr(config, "OPENCODE_SETTINGS_FILE_JSONC", path.with_suffix(".jsonc"))
     return path
+
+
+@pytest.fixture
+def opencode_settings_file_jsonc(opencode_settings_file):
+    return opencode_settings_file.with_suffix(".jsonc")
 
 
 class TestUpdateClaudeSettings:
@@ -89,3 +95,21 @@ class TestUpdateOpencodeSettings:
         data = json.loads(opencode_settings_file.read_text())
         models = data["provider"]["olist-ai-gateway"]["models"]
         assert list(models.keys()) == ["glm-4.6"]
+
+    def test_prefers_existing_jsonc_over_creating_json(
+        self, opencode_settings_file, opencode_settings_file_jsonc
+    ):
+        opencode_settings_file_jsonc.parent.mkdir(parents=True)
+        opencode_settings_file_jsonc.write_text(
+            """{
+  // pre-existing custom provider, with comments
+  "provider": { "my-custom-provider": { "npm": "@ai-sdk/openai-compatible" } }
+}"""
+        )
+
+        config.update_opencode_settings(make_config())
+
+        assert not opencode_settings_file.exists()
+        data = json.loads(config._strip_jsonc_comments(opencode_settings_file_jsonc.read_text()))
+        assert "my-custom-provider" in data["provider"]
+        assert "olist-ai-gateway" in data["provider"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 
 import typer
 from rich.align import Align
@@ -27,6 +27,25 @@ from .models import AdapterConfig, ModelConfig, SSOConfig
 from .proxy import fetch_gateway_models
 
 console = Console()
+
+Harness = Literal["claude", "opencode", "both"]
+_HARNESS_CHOICES: tuple[Harness, ...] = ("claude", "opencode", "both")
+
+
+def _resolve_harness(explicit: str | None, existing: AdapterConfig | None) -> Harness:
+    value = (explicit or (existing.harness if existing else "both")).strip().lower()
+    if value not in _HARNESS_CHOICES:
+        console.print(f"[red]--harness inválido: {value!r}. Use claude, opencode ou both.[/red]")
+        raise typer.Exit(code=1)
+    return cast(Harness, value)
+
+
+def _apply_settings(config: AdapterConfig) -> None:
+    if config.harness in ("claude", "both"):
+        update_claude_settings(config)
+        update_claude_json()
+    if config.harness in ("opencode", "both"):
+        update_opencode_settings(config)
 
 _OLIST_ART: list[str] = [
     "   ____  ___      __ ",
@@ -127,6 +146,10 @@ def run(
         str | None,
         typer.Option("--tool-format", help="Tool format: native or xml"),
     ] = None,
+    harness: Annotated[
+        str | None,
+        typer.Option("--harness", help="Which harness to configure: claude, opencode, or both"),
+    ] = None,
     model_opus: Annotated[
         str | None,
         typer.Option("--model-opus", help="Opus model name"),
@@ -175,6 +198,7 @@ def run(
         ),
         tool_format=resolved_tool_format,
         port=port or (existing.port if existing else 3080),
+        harness=_resolve_harness(harness, existing),
     )
 
     errors: list[str] = []
@@ -202,9 +226,7 @@ def run(
         save_config(config)
         console.print(f"[green]Config saved to {CONFIG_FILE}[/green]")
 
-    update_claude_settings(config)
-    update_claude_json()
-    update_opencode_settings(config)
+    _apply_settings(config)
 
     from .server import set_app_config
 
@@ -375,6 +397,12 @@ def init():
             break
         console.print("[red]Port must be a number.[/red]")
 
+    while True:
+        harness_str: str = typer.prompt("Qual harness você usa? (claude/opencode/both)", default="both")
+        if harness_str.strip().lower() in _HARNESS_CHOICES:
+            break
+        console.print("[red]Escolha claude, opencode ou both.[/red]")
+
     config = AdapterConfig(
         base_url=base_url.strip(),
         api_key=api_key.strip(),
@@ -385,12 +413,11 @@ def init():
             haiku=model_haiku.strip() if model_haiku else None,
         ),
         port=int(port_str.strip()),
+        harness=cast(Harness, harness_str.strip().lower()),
     )
 
     save_config(config)
-    update_claude_settings(config)
-    update_claude_json()
-    update_opencode_settings(config)
+    _apply_settings(config)
 
     next_steps = "  Run [bold]olist-code-adapter run[/bold] to start the proxy."
     if not config.api_key:

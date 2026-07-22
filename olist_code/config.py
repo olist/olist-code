@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,28 @@ CONFIG_DIR = Path.home() / ".olist-code-adapter"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 OPENCODE_SETTINGS_FILE = Path.home() / ".config" / "opencode" / "opencode.json"
+OPENCODE_SETTINGS_FILE_JSONC = OPENCODE_SETTINGS_FILE.with_suffix(".jsonc")
 OPENCODE_PROVIDER_ID = "olist-ai-gateway"
+OPENCODE_SCHEMA_URL = "https://opencode.ai/config.json"
+
+# Matches // and /* */ comments that are not inside a "..." string.
+_JSONC_COMMENT_RE = re.compile(r'("(?:\\.|[^"\\])*")|(//[^\n]*|/\*.*?\*/)', re.DOTALL)
+
+
+def _strip_jsonc_comments(text: str) -> str:
+    return _JSONC_COMMENT_RE.sub(lambda m: m.group(1) or "", text)
+
+
+def _resolve_opencode_settings_file() -> Path:
+    """Prefer an existing opencode.jsonc over creating a separate opencode.json."""
+    if OPENCODE_SETTINGS_FILE_JSONC.exists():
+        return OPENCODE_SETTINGS_FILE_JSONC
+    return OPENCODE_SETTINGS_FILE
+
+
+def _load_jsonc(path: Path) -> dict[str, Any]:
+    with open(path) as f:
+        return json.loads(_strip_jsonc_comments(f.read()))
 
 
 def ensure_config_dir() -> None:
@@ -62,14 +84,14 @@ def update_claude_settings(config: AdapterConfig) -> None:
 
 
 def update_opencode_settings(config: AdapterConfig) -> None:
-    OPENCODE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    target = _resolve_opencode_settings_file()
+    target.parent.mkdir(parents=True, exist_ok=True)
 
     existing: dict[str, Any] = {}
-    if OPENCODE_SETTINGS_FILE.exists():
-        with open(OPENCODE_SETTINGS_FILE) as f:
-            existing = json.load(f)
+    if target.exists():
+        existing = _load_jsonc(target)
 
-    existing.setdefault("$schema", "https://opencode.ai/config.json")
+    existing.setdefault("$schema", OPENCODE_SCHEMA_URL)
 
     if "provider" not in existing or not isinstance(existing["provider"], dict):
         existing["provider"] = {}
@@ -90,7 +112,7 @@ def update_opencode_settings(config: AdapterConfig) -> None:
         "models": models,
     }
 
-    with open(OPENCODE_SETTINGS_FILE, "w") as f:
+    with open(target, "w") as f:
         json.dump(existing, f, indent=2)
 
 
