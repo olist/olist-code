@@ -67,7 +67,8 @@ class TestAnthropicToOpenaiSimpleText:
         assert len(result.messages) == 1
         assert result.messages[0].role == "user"
         assert result.messages[0].content == "Olá, como vai?"
-        assert result.max_tokens == 1024
+        assert result.max_completion_tokens == 1024
+        assert result.max_tokens is None
         assert result.stream is False
         assert result.tools is None
 
@@ -562,4 +563,6 @@ class TestEdgeCases:
         )
         result = anthropic_to_openai(req, config)
         assert result.max_completion_tokens == 2048
-        assert result.max_tokens == 2048
+        # max_tokens must NOT also be set: some OpenAI-compatible upstreams
+        # (e.g. Huawei ModelArts) reject requests with both fields present.
+        assert result.max_tokens is None
