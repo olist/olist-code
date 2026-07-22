@@ -16,8 +16,12 @@ from rich.text import Text
 from .auth import AuthError, clear_tokens, load_tokens
 from .auth import login as sso_login
 from .config import (
+    CLAUDE_SETTINGS_FILE,
     CONFIG_FILE,
+    OPENCODE_SETTINGS_FILE,
     load_config,
+    restore_claude_settings,
+    restore_opencode_settings,
     save_config,
     update_claude_json,
     update_claude_settings,
@@ -363,6 +367,28 @@ def config_reset():
         console.print(f"[green]Config removed: {CONFIG_FILE}[/green]")
     else:
         console.print("[yellow]No config file found.[/yellow]")
+
+
+@cli.command()
+def restore():
+    """Undo everything olist-code wrote to Claude Code / opencode settings and remove the local config."""
+    restore_claude_settings()
+    restore_opencode_settings()
+
+    removed_local_config = CONFIG_FILE.exists()
+    if removed_local_config:
+        CONFIG_FILE.unlink()
+
+    console.print(
+        Panel.fit(
+            "[green]Configurações originais restauradas.[/green]\n\n"
+            + f"  Claude Code:  {CLAUDE_SETTINGS_FILE}\n"
+            + f"  opencode:     {OPENCODE_SETTINGS_FILE}\n"
+            + f"  Local config: {'removido' if removed_local_config else 'não existia'}",
+            title="[bold green]Restore[/bold green]",
+            border_style="green",
+        )
+    )
 
 
 @cli.command()
