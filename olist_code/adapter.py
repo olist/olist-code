@@ -173,9 +173,12 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
     return OpenAIRequest(
         model=request.model,
         messages=[OpenAIMessage(**msg) for msg in messages],
-        # Some OpenAI-compatible upstreams (e.g. Huawei ModelArts) reject
-        # requests that set both max_tokens and max_completion_tokens.
-        max_completion_tokens=max_tokens,
+        # Only max_tokens, not both: some upstreams (Huawei ModelArts)
+        # reject requests that set both max_tokens and
+        # max_completion_tokens, and some self-hosted OpenAI-compatible
+        # servers (older vLLM deployments) reject max_completion_tokens
+        # outright, since they only implement the older field.
+        max_tokens=max_tokens,
         stream=request.stream,
         temperature=request.temperature,
         top_p=request.top_p,
