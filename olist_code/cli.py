@@ -383,25 +383,37 @@ def init():
     )
 
     while True:
-        model_opus: str = typer.prompt("Opus model name", default="claude-sonnet-4-20250514")
-        if model_opus.strip():
+        harness_str: str = typer.prompt("Qual harness você usa? (claude/opencode/both)", default="both")
+        if harness_str.strip().lower() in _HARNESS_CHOICES:
             break
-        console.print("[red]Opus model name is required.[/red]")
+        console.print("[red]Escolha claude, opencode ou both.[/red]")
+    harness_choice = cast(Harness, harness_str.strip().lower())
 
-    model_sonnet: str | None = typer.prompt("Sonnet model name (leave blank to skip)", default="") or None
-    model_haiku: str | None = typer.prompt("Haiku model name (leave blank to skip)", default="") or None
+    if harness_choice == "opencode":
+        # opencode has no notion of Anthropic's opus/sonnet/haiku model tiers —
+        # it just needs a flat list of model ids to expose from the provider.
+        while True:
+            model_opus: str = typer.prompt("Nome do primeiro modelo")
+            if model_opus.strip():
+                break
+            console.print("[red]Informe ao menos um modelo.[/red]")
+        model_sonnet: str | None = typer.prompt("Nome do segundo modelo (branco pula)", default="") or None
+        model_haiku: str | None = typer.prompt("Nome do terceiro modelo (branco pula)", default="") or None
+    else:
+        while True:
+            model_opus = typer.prompt("Opus model name", default="claude-sonnet-4-20250514")
+            if model_opus.strip():
+                break
+            console.print("[red]Opus model name is required.[/red]")
+
+        model_sonnet = typer.prompt("Sonnet model name (leave blank to skip)", default="") or None
+        model_haiku = typer.prompt("Haiku model name (leave blank to skip)", default="") or None
 
     while True:
         port_str: str = typer.prompt("Proxy port", default="3080")
         if port_str.strip().isdigit():
             break
         console.print("[red]Port must be a number.[/red]")
-
-    while True:
-        harness_str: str = typer.prompt("Qual harness você usa? (claude/opencode/both)", default="both")
-        if harness_str.strip().lower() in _HARNESS_CHOICES:
-            break
-        console.print("[red]Escolha claude, opencode ou both.[/red]")
 
     config = AdapterConfig(
         base_url=base_url.strip(),
@@ -413,7 +425,7 @@ def init():
             haiku=model_haiku.strip() if model_haiku else None,
         ),
         port=int(port_str.strip()),
-        harness=cast(Harness, harness_str.strip().lower()),
+        harness=harness_choice,
     )
 
     save_config(config)
