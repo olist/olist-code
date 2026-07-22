@@ -67,8 +67,8 @@ class TestAnthropicToOpenaiSimpleText:
         assert len(result.messages) == 1
         assert result.messages[0].role == "user"
         assert result.messages[0].content == "Olá, como vai?"
-        assert result.max_completion_tokens == 1024
-        assert result.max_tokens is None
+        assert result.max_tokens == 1024
+        assert result.max_completion_tokens is None
         assert result.stream is False
         assert result.tools is None
 
@@ -579,14 +579,15 @@ class TestEdgeCases:
         result = anthropic_to_openai(req, config)
         assert result.tools is None
 
-    def test_max_completion_tokens_mapped(self, config: AdapterConfig) -> None:
+    def test_max_tokens_mapped_alone(self, config: AdapterConfig) -> None:
         req = AnthropicRequest(
             model="claude-sonnet-4-6",
             max_tokens=2048,
             messages=[AnthropicMessage(role=AnthropicRole.user, content="Hi")],
         )
         result = anthropic_to_openai(req, config)
-        assert result.max_completion_tokens == 2048
-        # max_tokens must NOT also be set: some OpenAI-compatible upstreams
-        # (e.g. Huawei ModelArts) reject requests with both fields present.
-        assert result.max_tokens is None
+        assert result.max_tokens == 2048
+        # max_completion_tokens must NOT also be set: some upstreams reject
+        # both fields together, and some self-hosted OpenAI-compatible
+        # servers (older vLLM) reject max_completion_tokens outright.
+        assert result.max_completion_tokens is None
