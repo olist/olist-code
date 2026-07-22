@@ -173,8 +173,9 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
     return OpenAIRequest(
         model=request.model,
         messages=[OpenAIMessage(**msg) for msg in messages],
+        # Some OpenAI-compatible upstreams (e.g. Huawei ModelArts) reject
+        # requests that set both max_tokens and max_completion_tokens.
         max_completion_tokens=max_tokens,
-        max_tokens=max_tokens,
         stream=request.stream,
         temperature=request.temperature,
         top_p=request.top_p,
@@ -191,7 +192,9 @@ def openai_to_anthropic_response(data: OpenAIResponseChunk) -> AnthropicResponse
         return {"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 0, "output_tokens": 0}}
 
     choice = choices[0]
-    delta = choice.get("delta", {})
+    # Non-streaming responses carry the message under "message"; only
+    # streaming chunks use "delta". Prefer whichever is present.
+    delta = choice.get("message") or choice.get("delta") or {}
     finish_reason = choice.get("finish_reason")
 
     stop_reason = "end_turn"

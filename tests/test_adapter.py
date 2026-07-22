@@ -67,7 +67,8 @@ class TestAnthropicToOpenaiSimpleText:
         assert len(result.messages) == 1
         assert result.messages[0].role == "user"
         assert result.messages[0].content == "Olá, como vai?"
-        assert result.max_tokens == 1024
+        assert result.max_completion_tokens == 1024
+        assert result.max_tokens is None
         assert result.stream is False
         assert result.tools is None
 
@@ -93,6 +94,30 @@ class TestAnthropicToOpenaiSimpleText:
         assert result["content"][0] == {"type": "text", "text": "Olá! Estou bem, obrigado. Como posso ajudar?"}
         assert result["usage"]["input_tokens"] == 12
         assert result["usage"]["output_tokens"] == 18
+
+    def test_non_streaming_response_uses_message_key(self) -> None:
+        """The real (non-streaming) OpenAI Chat Completions API puts the
+        assistant reply under choices[0].message, not choices[0].delta —
+        delta only appears in streaming chunks."""
+        openai_resp: OpenAIResponseChunk = {
+            "id": "chatcmpl-abc123",
+            "object": "chat.completion",
+            "created": 1720000000,
+            "model": "gpt-4o",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Olá! Estou bem, obrigado."},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 18, "total_tokens": 30},
+        }
+        result = openai_to_anthropic_response(openai_resp)
+
+        assert result["stop_reason"] == "end_turn"
+        assert len(result["content"]) == 1
+        assert result["content"][0] == {"type": "text", "text": "Olá! Estou bem, obrigado."}
 
 
 # ── Anthropic → OpenAI: with_system ──────────────────────────────────────────
@@ -562,4 +587,6 @@ class TestEdgeCases:
         )
         result = anthropic_to_openai(req, config)
         assert result.max_completion_tokens == 2048
-        assert result.max_tokens == 2048
+        # max_tokens must NOT also be set: some OpenAI-compatible upstreams
+        # (e.g. Huawei ModelArts) reject requests with both fields present.
+        assert result.max_tokens is None
