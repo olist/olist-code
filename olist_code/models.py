@@ -389,6 +389,7 @@ class AdapterConfig(BaseModel):
     models: ModelConfig
     tool_format: Literal["native", "xml"] = "native"
     port: int = 3080
+    harness: Literal["claude", "opencode", "both"] = "both"
 
 
 class ClaudeSettings(BaseModel):

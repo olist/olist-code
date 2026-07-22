@@ -1,0 +1,115 @@
+"""Tests for settings-file writers (Claude Code and opencode)."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from olist_code import config
+from olist_code.models import AdapterConfig, ModelConfig
+
+
+def make_config(**overrides) -> AdapterConfig:
+    defaults = dict(
+        base_url="http://localhost:8000",
+        api_key="sk-olist-x",
+        sso=None,
+        models=ModelConfig(opus="glm-4.6", sonnet="glm-4.5", haiku=None),
+        port=3080,
+    )
+    defaults.update(overrides)
+    return AdapterConfig(**defaults)
+
+
+@pytest.fixture
+def claude_settings_file(tmp_path, monkeypatch):
+    path = tmp_path / ".claude" / "settings.json"
+    monkeypatch.setattr(config, "CLAUDE_SETTINGS_FILE", path)
+    return path
+
+
+@pytest.fixture
+def opencode_settings_file(tmp_path, monkeypatch):
+    path = tmp_path / ".config" / "opencode" / "opencode.json"
+    monkeypatch.setattr(config, "OPENCODE_SETTINGS_FILE", path)
+    monkeypatch.setattr(config, "OPENCODE_SETTINGS_FILE_JSONC", path.with_suffix(".jsonc"))
+    return path
+
+
+@pytest.fixture
+def opencode_settings_file_jsonc(opencode_settings_file):
+    return opencode_settings_file.with_suffix(".jsonc")
+
+
+class TestUpdateClaudeSettings:
+    def test_writes_env_vars(self, claude_settings_file):
+        config.update_claude_settings(make_config())
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
+        assert data["env"]["ANTHROPIC_AUTH_TOKEN"] == "default"
+        assert data["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "glm-4.6"
+        assert data["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "glm-4.5"
+        assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in data["env"]
+
+    def test_preserves_unrelated_keys(self, claude_settings_file):
+        claude_settings_file.parent.mkdir(parents=True)
+        claude_settings_file.write_text(json.dumps({"foo": "bar", "env": {"OTHER": "1"}}))
+
+        config.update_claude_settings(make_config())
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["foo"] == "bar"
+        assert data["env"]["OTHER"] == "1"
+        assert data["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
+
+
+class TestUpdateOpencodeSettings:
+    def test_writes_provider(self, opencode_settings_file):
+        config.update_opencode_settings(make_config())
+
+        data = json.loads(opencode_settings_file.read_text())
+        provider = data["provider"]["olist-ai-gateway"]
+        assert provider["npm"] == "@ai-sdk/openai-compatible"
+        assert provider["options"]["baseURL"] == "http://localhost:3080/v1"
+        assert provider["options"]["apiKey"] == "default"
+        assert "glm-4.6" in provider["models"]
+        assert "glm-4.5" in provider["models"]
+
+    def test_preserves_other_providers(self, opencode_settings_file):
+        opencode_settings_file.parent.mkdir(parents=True)
+        opencode_settings_file.write_text(
+            json.dumps({"provider": {"anthropic": {"npm": "@ai-sdk/anthropic"}}})
+        )
+
+        config.update_opencode_settings(make_config())
+
+        data = json.loads(opencode_settings_file.read_text())
+        assert "anthropic" in data["provider"]
+        assert "olist-ai-gateway" in data["provider"]
+
+    def test_omits_unset_models(self, opencode_settings_file):
+        config.update_opencode_settings(make_config(models=ModelConfig(opus="glm-4.6")))
+
+        data = json.loads(opencode_settings_file.read_text())
+        models = data["provider"]["olist-ai-gateway"]["models"]
+        assert list(models.keys()) == ["glm-4.6"]
+
+    def test_prefers_existing_jsonc_over_creating_json(
+        self, opencode_settings_file, opencode_settings_file_jsonc
+    ):
+        opencode_settings_file_jsonc.parent.mkdir(parents=True)
+        opencode_settings_file_jsonc.write_text(
+            """{
+  // pre-existing custom provider, with comments
+  "provider": { "my-custom-provider": { "npm": "@ai-sdk/openai-compatible" } }
+}"""
+        )
+
+        config.update_opencode_settings(make_config())
+
+        assert not opencode_settings_file.exists()
+        data = json.loads(config._strip_jsonc_comments(opencode_settings_file_jsonc.read_text()))
+        assert "my-custom-provider" in data["provider"]
+        assert "olist-ai-gateway" in data["provider"]
