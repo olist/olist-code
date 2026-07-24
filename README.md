@@ -4,19 +4,26 @@ Proxy local que faz o Claude Code e o opencode apontarem para o Olist AI Gateway
 
 ## Instalação
 
+Como o repositório é privado, é preciso ter o [`gh` CLI](https://cli.github.com) instalado e autenticado (`gh auth login`) **ou** uma env var `GITHUB_TOKEN` com acesso de leitura ao repo. Isso vale mesmo pra quem usa SSH no dia a dia com git — a autenticação do `gh`/`GITHUB_TOKEN` é separada da chave SSH, e é ela que dá acesso pra baixar os scripts e os binários das releases.
+
 **macOS / Linux**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/olist/olist-code/main/scripts/install.sh | bash
+curl -fsSL -H "Authorization: token $(gh auth token)" \
+  https://raw.githubusercontent.com/olist/olist-code/main/scripts/install.sh | bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/olist/olist-code/main/scripts/install.ps1 | iex
+$token = gh auth token
+irm -Headers @{ Authorization = "token $token" } `
+  https://raw.githubusercontent.com/olist/olist-code/main/scripts/install.ps1 | iex
 ```
 
-Os scripts baixam o binário da [release](https://github.com/olist/olist-code/releases) mais recente. Como o repositório é privado, é preciso ter o `gh` CLI autenticado (`gh auth login`) ou definir a env var `GITHUB_TOKEN` com acesso de leitura ao repo.
+Sem `gh`, dá pra usar `GITHUB_TOKEN` no lugar de `$(gh auth token)` / `gh auth token`.
+
+Os scripts baixam o binário da [release](https://github.com/olist/olist-code/releases) mais recente pro seu SO.
 
 ## Uso
 
