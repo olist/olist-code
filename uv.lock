@@ -366,7 +366,7 @@ wheels = [
 
 [[package]]
 name = "olist-code"
-version = "2.2.0"
+version = "0.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

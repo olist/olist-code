@@ -175,6 +175,7 @@ def run(
         typer.Option("--login", "-l", help="Run the backoffice SSO login before starting"),
     ] = False,
 ):
+    """Start the local proxy and point Claude Code / opencode at it."""
     existing = load_config()
 
     if do_login:
@@ -338,6 +339,7 @@ def logout():
 
 @cli.command()
 def config_show():
+    """Print the saved olist-code config (base URL, port, models, masked API key)."""
     cfg = load_config()
     if cfg is None:
         console.print("[yellow]No configuration found.[/yellow]")
@@ -362,6 +364,7 @@ def config_show():
 
 @cli.command()
 def config_reset():
+    """Remove the local olist-code config only; leaves Claude Code / opencode settings untouched (use restore for that)."""
     if CONFIG_FILE.exists():
         CONFIG_FILE.unlink()
         console.print(f"[green]Config removed: {CONFIG_FILE}[/green]")
@@ -393,6 +396,7 @@ def restore():
 
 @cli.command()
 def init():
+    """Interactive wizard to configure the gateway URL, models, and harness, saved for future runs."""
     console.print("[bold]Olist Code Adapter[/bold] — Configuration Wizard\n")
 
     while True:
@@ -479,6 +483,7 @@ def init():
 
 @cli.command()
 def version():
+    """Print the installed olist-code version."""
     from . import __version__
 
     console.print(f"[bold]Olist Code Adapter[/bold] v{__version__}")
