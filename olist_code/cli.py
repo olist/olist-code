@@ -32,6 +32,8 @@ from .proxy import fetch_gateway_models
 
 console = Console()
 
+GATEWAY_BASE_URL = "https://olist-ai-gateway-ai.prd.olistcloud.com/"
+
 Harness = Literal["claude", "opencode", "both"]
 _HARNESS_CHOICES: tuple[Harness, ...] = ("claude", "opencode", "both")
 
@@ -93,7 +95,7 @@ cli = typer.Typer(
     name="olist-code",
     help="Olist Code Client — Proxy that translates Anthropic Messages API to OpenAI Chat Completions",
     add_completion=False,
-    no_args_is_help=True,
+    no_args_is_help=False,
 )
 
 
@@ -132,53 +134,25 @@ def _pick_model(config: AdapterConfig) -> str | None:
     return model_name
 
 
-@cli.command()
-def run(
-    base_url: Annotated[
-        str | None,
-        typer.Option("--base-url", "-u", help="Upstream API base URL (e.g. https://api.openai.com)"),
-    ] = None,
-    api_key: Annotated[
-        str | None,
-        typer.Option("--api-key", "-k", help="Upstream API key"),
-    ] = None,
+@cli.callback(invoke_without_command=True)
+def main_default(
+    ctx: typer.Context,
     port: Annotated[
         int | None,
         typer.Option("--port", "-p", help="Local proxy port"),
-    ] = None,
-    tool_format: Annotated[
-        str | None,
-        typer.Option("--tool-format", help="Tool format: native or xml"),
     ] = None,
     harness: Annotated[
         str | None,
         typer.Option("--harness", help="Which harness to configure: claude, opencode, or both"),
     ] = None,
-    model_opus: Annotated[
-        str | None,
-        typer.Option("--model-opus", help="Opus model name"),
-    ] = None,
-    model_sonnet: Annotated[
-        str | None,
-        typer.Option("--model-sonnet", help="Sonnet model name"),
-    ] = None,
-    model_haiku: Annotated[
-        str | None,
-        typer.Option("--model-haiku", help="Haiku model name"),
-    ] = None,
-    save: Annotated[
-        bool,
-        typer.Option("--save", "-s", help="Save config to disk for future runs"),
-    ] = False,
-    do_login: Annotated[
-        bool,
-        typer.Option("--login", "-l", help="Run the backoffice SSO login before starting"),
-    ] = False,
 ):
-    """Start the local proxy and point Claude Code / opencode at it."""
+    """Start the proxy: logs in and picks a model automatically the first time, then reuses the saved config."""
+    if ctx.invoked_subcommand is not None:
+        return
+
     existing = load_config()
 
-    if do_login:
+    if not (existing and existing.api_key) and load_tokens() is None:
         sso = (existing.sso if existing else None) or SSOConfig()
         console.print(f"Abrindo o navegador para autenticar em [bold]{sso.issuer}[/bold]...")
         try:
@@ -188,48 +162,33 @@ def run(
             console.print(f"[red]Login falhou:[/red] {exc}")
             raise typer.Exit(code=1)
 
-    resolved_tool_format: Literal["native", "xml"] = (
-        "native" if (tool_format or (existing.tool_format if existing else "native")) == "native" else "xml"
-    )
-
     config = AdapterConfig(
-        base_url=base_url or (existing.base_url if existing else ""),
-        api_key=api_key if api_key is not None else (existing.api_key if existing else ""),
+        base_url=GATEWAY_BASE_URL,
+        api_key=existing.api_key if existing else "",
         sso=existing.sso if existing else None,
         models=ModelConfig(
-            opus=model_opus or (existing.models.opus if existing else ""),
-            sonnet=model_sonnet or (existing.models.sonnet if existing else None),
-            haiku=model_haiku or (existing.models.haiku if existing else None),
+            opus=existing.models.opus if existing else "",
+            sonnet=existing.models.sonnet if existing else None,
+            haiku=existing.models.haiku if existing else None,
         ),
-        tool_format=resolved_tool_format,
+        tool_format=existing.tool_format if existing else "native",
         port=port or (existing.port if existing else 3080),
         harness=_resolve_harness(harness, existing),
     )
 
-    errors: list[str] = []
-    if not config.base_url:
-        errors.append("base_url is required (use --base-url or save a config first)")
-    if not config.api_key and load_tokens() is None:
-        errors.append(
-            "no credential found: use --api-key, or run [bold]olist-code login[/bold] to sign in with the backoffice SSO"
-        )
+    needs_save = existing is None
 
-    if errors:
-        for err in errors:
-            console.print(f"[red]Error:[/red] {err}")
-        raise typer.Exit(code=1)
-
-    if model_opus is None:
+    if not config.models.opus:
         picked = _pick_model(config)
-        if picked:
-            config.models.opus = picked
-        elif not config.models.opus:
-            console.print("[red]Opus model is required (use --model-opus)[/red]")
+        if not picked:
+            console.print("[red]Não foi possível selecionar um modelo.[/red]")
             raise typer.Exit(code=1)
+        config.models.opus = picked
+        needs_save = True
 
-    if save:
+    if needs_save:
         save_config(config)
-        console.print(f"[green]Config saved to {CONFIG_FILE}[/green]")
+        console.print(f"[green]Config salva em {CONFIG_FILE}[/green]")
 
     _apply_settings(config)
 
@@ -338,13 +297,13 @@ def logout():
 
 
 @cli.command()
-def config_show():
+def config():
     """Print the saved olist-code config (base URL, port, models, masked API key)."""
     cfg = load_config()
     if cfg is None:
         console.print("[yellow]No configuration found.[/yellow]")
         console.print(f"  Config file: {CONFIG_FILE}")
-        console.print("  Run [bold]olist-code init[/bold] to create one.")
+        console.print("  Run [bold]olist-code[/bold] to create one.")
         return
 
     console.print(
@@ -360,16 +319,6 @@ def config_show():
             border_style="blue",
         )
     )
-
-
-@cli.command()
-def config_reset():
-    """Remove the local olist-code config only; leaves Claude Code / opencode settings untouched (use restore for that)."""
-    if CONFIG_FILE.exists():
-        CONFIG_FILE.unlink()
-        console.print(f"[green]Config removed: {CONFIG_FILE}[/green]")
-    else:
-        console.print("[yellow]No config file found.[/yellow]")
 
 
 @cli.command()
@@ -395,93 +344,6 @@ def restore():
 
 
 @cli.command()
-def init():
-    """Interactive wizard to configure the gateway URL, models, and harness, saved for future runs."""
-    console.print("[bold]Olist Code Adapter[/bold] — Configuration Wizard\n")
-
-    while True:
-        base_url: str = typer.prompt("Upstream API base URL", default="https://api.openai.com")
-        if base_url.strip():
-            break
-        console.print("[red]Base URL is required.[/red]")
-
-    api_key: str = typer.prompt(
-        "API key (deixe em branco para usar o SSO do backoffice)",
-        hide_input=True,
-        default="",
-        show_default=False,
-    )
-
-    while True:
-        harness_str: str = typer.prompt("Qual harness você usa? (claude/opencode/both)", default="both")
-        if harness_str.strip().lower() in _HARNESS_CHOICES:
-            break
-        console.print("[red]Escolha claude, opencode ou both.[/red]")
-    harness_choice = cast(Harness, harness_str.strip().lower())
-
-    if harness_choice == "opencode":
-        # opencode has no notion of Anthropic's opus/sonnet/haiku model tiers —
-        # it just needs a flat list of model ids to expose from the provider.
-        while True:
-            model_opus: str = typer.prompt("Nome do primeiro modelo")
-            if model_opus.strip():
-                break
-            console.print("[red]Informe ao menos um modelo.[/red]")
-        model_sonnet: str | None = typer.prompt("Nome do segundo modelo (branco pula)", default="") or None
-        model_haiku: str | None = typer.prompt("Nome do terceiro modelo (branco pula)", default="") or None
-    else:
-        while True:
-            model_opus = typer.prompt("Opus model name", default="claude-sonnet-4-20250514")
-            if model_opus.strip():
-                break
-            console.print("[red]Opus model name is required.[/red]")
-
-        model_sonnet = typer.prompt("Sonnet model name (leave blank to skip)", default="") or None
-        model_haiku = typer.prompt("Haiku model name (leave blank to skip)", default="") or None
-
-    while True:
-        port_str: str = typer.prompt("Proxy port", default="3080")
-        if port_str.strip().isdigit():
-            break
-        console.print("[red]Port must be a number.[/red]")
-
-    config = AdapterConfig(
-        base_url=base_url.strip(),
-        api_key=api_key.strip(),
-        sso=SSOConfig() if not api_key.strip() else None,
-        models=ModelConfig(
-            opus=model_opus.strip(),
-            sonnet=model_sonnet.strip() if model_sonnet else None,
-            haiku=model_haiku.strip() if model_haiku else None,
-        ),
-        port=int(port_str.strip()),
-        harness=harness_choice,
-    )
-
-    save_config(config)
-    _apply_settings(config)
-
-    next_steps = "  Run [bold]olist-code run[/bold] to start the proxy."
-    if not config.api_key:
-        next_steps = (
-            "  Run [bold]olist-code login[/bold] to sign in with the backoffice SSO,\n"
-            + "  then [bold]olist-code run[/bold] to start the proxy."
-        )
-
-    console.print()
-    console.print(
-        Panel.fit(
-            "[green]Configuration saved![/green]\n\n"
-            + f"  Config:  {CONFIG_FILE}\n"
-            + f"  Port:    {config.port}\n\n"
-            + next_steps,
-            title="[bold green]Done[/bold green]",
-            border_style="green",
-        )
-    )
-
-
-@cli.command()
 def version():
     """Print the installed olist-code version."""
     from . import __version__
@@ -490,7 +352,7 @@ def version():
 
 
 def main() -> None:
-    show_banner = len(sys.argv) <= 1 or (len(sys.argv) > 1 and sys.argv[1] in ("run", "--help", "-h"))
+    show_banner = len(sys.argv) <= 1 or sys.argv[1] in ("--help", "-h")
     if show_banner:
         _print_banner()
     cli()
