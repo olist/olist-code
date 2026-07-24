@@ -344,7 +344,7 @@ def config_show():
     if cfg is None:
         console.print("[yellow]No configuration found.[/yellow]")
         console.print(f"  Config file: {CONFIG_FILE}")
-        console.print("  Run [bold]olist-code-adapter init[/bold] to create one.")
+        console.print("  Run [bold]olist-code init[/bold] to create one.")
         return
 
     console.print(
@@ -461,11 +461,11 @@ def init():
     save_config(config)
     _apply_settings(config)
 
-    next_steps = "  Run [bold]olist-code-adapter run[/bold] to start the proxy."
+    next_steps = "  Run [bold]olist-code run[/bold] to start the proxy."
     if not config.api_key:
         next_steps = (
             "  Run [bold]olist-code login[/bold] to sign in with the backoffice SSO,\n"
-            + "  then [bold]olist-code-adapter run[/bold] to start the proxy."
+            + "  then [bold]olist-code run[/bold] to start the proxy."
         )
 
     console.print()
