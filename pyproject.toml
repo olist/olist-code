@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "olist-code"
-version = "2.2.1"
+version = "0.0.2"
 description = "Olist Code Adapter - Proxy that translates Anthropic Messages API to OpenAI Chat Completions"
 readme = "README.md"
 requires-python = ">=3.14"
