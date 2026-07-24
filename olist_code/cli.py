@@ -46,6 +46,19 @@ def _resolve_harness(explicit: str | None, existing: AdapterConfig | None) -> Ha
     return cast(Harness, value)
 
 
+def _prompt_harness() -> Harness:
+    console.print("Qual harness você usa?")
+    console.print("  [cyan]1[/cyan] - Claude Code")
+    console.print("  [cyan]2[/cyan] - opencode")
+    console.print("  [cyan]3[/cyan] - ambos (both)")
+    while True:
+        choice: str = typer.prompt("Escolha [1-3]", default="1")
+        if choice.strip() in {"1", "2", "3"}:
+            break
+        console.print("[red]Escolha 1, 2 ou 3.[/red]")
+    return cast(Harness, ("claude", "opencode", "both")[int(choice.strip()) - 1])
+
+
 def _apply_settings(config: AdapterConfig) -> None:
     if config.harness in ("claude", "both"):
         update_claude_settings(config)
@@ -162,6 +175,14 @@ def main_default(
             console.print(f"[red]Login falhou:[/red] {exc}")
             raise typer.Exit(code=1)
 
+    resolved_harness: Harness | None = None
+    if harness is not None:
+        resolved_harness = _resolve_harness(harness, existing)
+    elif existing is not None:
+        resolved_harness = _resolve_harness(None, existing)
+    else:
+        resolved_harness = _prompt_harness()
+
     config = AdapterConfig(
         base_url=GATEWAY_BASE_URL,
         api_key=existing.api_key if existing else "",
@@ -173,7 +194,7 @@ def main_default(
         ),
         tool_format=existing.tool_format if existing else "native",
         port=port or (existing.port if existing else 3080),
-        harness=_resolve_harness(harness, existing),
+        harness=resolved_harness,
     )
 
     needs_save = existing is None
@@ -323,7 +344,7 @@ def config():
 
 @cli.command()
 def restore():
-    """Undo everything olist-code wrote to Claude Code / opencode settings and remove the local config."""
+    """Undo everything olist-code wrote: Claude Code / opencode settings, local config, and SSO session."""
     restore_claude_settings()
     restore_opencode_settings()
 
@@ -331,12 +352,15 @@ def restore():
     if removed_local_config:
         CONFIG_FILE.unlink()
 
+    removed_session = clear_tokens()
+
     console.print(
         Panel.fit(
             "[green]Configurações originais restauradas.[/green]\n\n"
             + f"  Claude Code:  {CLAUDE_SETTINGS_FILE}\n"
             + f"  opencode:     {OPENCODE_SETTINGS_FILE}\n"
-            + f"  Local config: {'removido' if removed_local_config else 'não existia'}",
+            + f"  Local config: {'removido' if removed_local_config else 'não existia'}\n"
+            + f"  Sessão SSO:   {'removida' if removed_session else 'não existia'}",
             title="[bold green]Restore[/bold green]",
             border_style="green",
         )
