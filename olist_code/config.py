@@ -64,7 +64,28 @@ def save_config(config: AdapterConfig) -> None:
         json.dump(config.model_dump(), f, indent=2)
 
 
+def claude_env(config: AdapterConfig) -> dict[str, str]:
+    """Env vars that point Claude Code at the local proxy.
+
+    Injected into the `olist-code claude` child process instead of being written to
+    the user's global settings.json, so a plain `claude` keeps using their own account.
+    """
+    return {
+        "ANTHROPIC_BASE_URL": f"http://localhost:{config.port}",
+        "ANTHROPIC_AUTH_TOKEN": "default",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": config.models.opus,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": config.models.sonnet or config.models.opus,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": config.models.haiku or config.models.sonnet or config.models.opus,
+    }
+
+
 def update_claude_settings(config: AdapterConfig) -> None:
+    """Point every `claude` at the proxy by writing the env into the global settings.
+
+    Reaches surfaces that never go through `olist-code claude` — the IDE extensions,
+    the desktop app, `claude -p` in scripts — at the cost of taking over the user's
+    plain `claude`. See claude_env() for the opt-out.
+    """
     CLAUDE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     existing: dict[str, Any] = {}
@@ -72,21 +93,10 @@ def update_claude_settings(config: AdapterConfig) -> None:
         with open(CLAUDE_SETTINGS_FILE) as f:
             existing = json.load(f)
 
-    if "env" not in existing:
-        existing["env"] = {}
-
-    env = existing["env"]
+    env = existing.get("env")
     if not isinstance(env, dict):
         env = {}
-        existing["env"] = env
-
-    base_url = f"http://localhost:{config.port}"
-    env["ANTHROPIC_BASE_URL"] = base_url
-    env["ANTHROPIC_AUTH_TOKEN"] = "default"
-    env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = config.models.opus
-    env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = config.models.sonnet or config.models.opus
-    if config.models.haiku:
-        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = config.models.haiku
+    existing["env"] = {**env, **claude_env(config)}
 
     with open(CLAUDE_SETTINGS_FILE, "w") as f:
         json.dump(existing, f, indent=2)

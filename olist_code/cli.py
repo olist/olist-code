@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import subprocess
 import sys
 from typing import Annotated, Literal, cast
 
+import httpx
 import typer
 from rich.align import Align
 from rich.console import Console
@@ -19,6 +23,7 @@ from .config import (
     CLAUDE_SETTINGS_FILE,
     CONFIG_FILE,
     OPENCODE_SETTINGS_FILE,
+    claude_env,
     load_config,
     restore_claude_settings,
     restore_opencode_settings,
@@ -59,12 +64,81 @@ def _prompt_harness() -> Harness:
     return cast(Harness, ("claude", "opencode", "both")[int(choice.strip()) - 1])
 
 
-def _apply_settings(config: AdapterConfig) -> None:
+def _apply_settings(config: AdapterConfig, isolated: bool = False) -> None:
     if config.harness in ("claude", "both"):
-        update_claude_settings(config)
+        if isolated:
+            # `olist-code claude` carries the config per-process; drop anything a
+            # previous plain `olist-code` left behind so bare `claude` comes back.
+            restore_claude_settings()
+        else:
+            update_claude_settings(config)
         update_claude_json()
     if config.harness in ("opencode", "both"):
         update_opencode_settings(config)
+
+
+def _require_config() -> AdapterConfig:
+    cfg = load_config()
+    if cfg is None or not cfg.models.opus:
+        console.print("[red]Nenhuma config encontrada.[/red]")
+        console.print("Rode [bold]olist-code[/bold] uma vez para fazer login e escolher o modelo.")
+        raise typer.Exit(code=1)
+    return cfg
+
+
+def _require_proxy(config: AdapterConfig) -> None:
+    try:
+        httpx.get(f"http://localhost:{config.port}/health", timeout=2.0).raise_for_status()
+    except Exception:
+        console.print(f"[red]O proxy não está respondendo em http://localhost:{config.port}[/red]")
+        console.print(
+            "Rode [bold]olist-code[/bold] (ou [bold]olist-code standalone[/bold]) em outro terminal primeiro."
+        )
+        raise typer.Exit(code=1)
+
+
+# Vars PyInstaller rewrites so the frozen binary finds its own bundled libraries. It
+# stashes whatever was there before in <VAR>_ORIG.
+_FROZEN_LOADER_VARS = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "LIBPATH")
+
+
+def _child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Our env plus `extra`, with PyInstaller's loader paths undone.
+
+    Left in place, the child would look for its shared libraries inside our unpacked
+    bundle instead of its own install.
+    """
+    env = {**os.environ, **(extra or {})}
+    if not getattr(sys, "frozen", False):
+        return env
+
+    env.pop("_MEIPASS2", None)
+    for var in _FROZEN_LOADER_VARS:
+        original = env.pop(f"{var}_ORIG", None)
+        if original:
+            env[var] = original
+        else:
+            env.pop(var, None)
+    return env
+
+
+def _launch(command: str, args: list[str], env: dict[str, str] | None = None) -> None:
+    """Run `command` in the foreground, then exit with its status code."""
+    exe = shutil.which(command)
+    if exe is None:
+        console.print(f"[red]`{command}` não encontrado no PATH.[/red]")
+        raise typer.Exit(code=1)
+
+    proc = subprocess.Popen([exe, *args], env=_child_env(env))
+    while True:
+        try:
+            code = proc.wait()
+            break
+        except KeyboardInterrupt:
+            # Ctrl+C already reached the child via the shared process group; it decides
+            # when to exit, and we stay around to report its status.
+            continue
+    raise typer.Exit(code=code)
 
 _OLIST_ART: list[str] = [
     "   ____  ___      __ ",
@@ -147,22 +221,54 @@ def _pick_model(config: AdapterConfig) -> str | None:
     return model_name
 
 
+_PORT_OPTION = Annotated[int | None, typer.Option("--port", "-p", help="Local proxy port")]
+_HARNESS_OPTION = Annotated[
+    str | None,
+    typer.Option("--harness", help="Which harness to configure: claude, opencode, or both"),
+]
 @cli.callback(invoke_without_command=True)
-def main_default(
-    ctx: typer.Context,
-    port: Annotated[
-        int | None,
-        typer.Option("--port", "-p", help="Local proxy port"),
-    ] = None,
-    harness: Annotated[
-        str | None,
-        typer.Option("--harness", help="Which harness to configure: claude, opencode, or both"),
-    ] = None,
-):
+def main_default(ctx: typer.Context, port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
     """Start the proxy: logs in and picks a model automatically the first time, then reuses the saved config."""
     if ctx.invoked_subcommand is not None:
         return
+    _run_server(port, harness, isolated=False)
 
+
+@cli.command("standalone")
+def standalone_command(port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
+    """Start the proxy without touching the global Claude Code settings.
+
+    A plain `claude` keeps using your own Anthropic account; reach the gateway with
+    `olist-code claude` instead. Also undoes what a previous plain `olist-code` wrote.
+    """
+    _run_server(port, harness, isolated=True)
+
+
+@cli.command(
+    "claude",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def claude_command(ctx: typer.Context):
+    """Open Claude Code against the proxy. Any extra args are passed straight to `claude`."""
+    config = _require_config()
+    _require_proxy(config)
+    update_claude_json()
+    _launch("claude", ctx.args, claude_env(config))
+
+
+@cli.command(
+    "opencode",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def opencode_command(ctx: typer.Context):
+    """Open opencode against the proxy. Any extra args are passed straight to `opencode`."""
+    config = _require_config()
+    _require_proxy(config)
+    update_opencode_settings(config)
+    _launch("opencode", ctx.args)
+
+
+def _run_server(port: int | None, harness: str | None, isolated: bool) -> None:
     existing = load_config()
 
     if not (existing and existing.api_key) and load_tokens() is None:
@@ -211,7 +317,7 @@ def main_default(
         save_config(config)
         console.print(f"[green]Config salva em {CONFIG_FILE}[/green]")
 
-    _apply_settings(config)
+    _apply_settings(config, isolated)
 
     from .server import set_app_config
 
@@ -226,7 +332,13 @@ def main_default(
             + f"  Tool fmt:  {config.tool_format}\n"
             + f"  Models:    opus={config.models.opus}, "
             + f"sonnet={config.models.sonnet or '—'}, "
-            + f"haiku={config.models.haiku or '—'}",
+            + f"haiku={config.models.haiku or '—'}\n"
+            + "  Claude:    "
+            + (
+                "standalone — abra com `olist-code claude`"
+                if isolated
+                else "settings.json global — `claude` já aponta pro gateway"
+            ),
             title="[bold green]Proxy[/bold green]",
             border_style="green",
         )
@@ -376,7 +488,7 @@ def version():
 
 
 def main() -> None:
-    show_banner = len(sys.argv) <= 1 or sys.argv[1] in ("--help", "-h")
+    show_banner = len(sys.argv) <= 1 or sys.argv[1] in ("--help", "-h", "standalone")
     if show_banner:
         _print_banner()
     cli()
