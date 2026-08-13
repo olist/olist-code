@@ -390,9 +390,6 @@ class AdapterConfig(BaseModel):
     tool_format: Literal["native", "xml"] = "native"
     port: int = 3080
     harness: Literal["claude", "opencode", "both"] = "both"
-    # When true, Claude Code is configured per-process by `olist-code claude` and the
-    # global settings.json is left alone, so a plain `claude` keeps the user's own account.
-    isolated: bool = False
 
 
 class ClaudeSettings(BaseModel):

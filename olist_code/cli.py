@@ -64,11 +64,11 @@ def _prompt_harness() -> Harness:
     return cast(Harness, ("claude", "opencode", "both")[int(choice.strip()) - 1])
 
 
-def _apply_settings(config: AdapterConfig) -> None:
+def _apply_settings(config: AdapterConfig, isolated: bool = False) -> None:
     if config.harness in ("claude", "both"):
-        if config.isolated:
+        if isolated:
             # `olist-code claude` carries the config per-process; drop anything a
-            # previous non-isolated run left behind so plain `claude` comes back.
+            # previous plain `olist-code` left behind so bare `claude` comes back.
             restore_claude_settings()
         else:
             update_claude_settings(config)
@@ -81,7 +81,7 @@ def _require_config() -> AdapterConfig:
     cfg = load_config()
     if cfg is None or not cfg.models.opus:
         console.print("[red]Nenhuma config encontrada.[/red]")
-        console.print("Rode [bold]olist-code server[/bold] uma vez para fazer login e escolher o modelo.")
+        console.print("Rode [bold]olist-code[/bold] uma vez para fazer login e escolher o modelo.")
         raise typer.Exit(code=1)
     return cfg
 
@@ -91,7 +91,9 @@ def _require_proxy(config: AdapterConfig) -> None:
         httpx.get(f"http://localhost:{config.port}/health", timeout=2.0).raise_for_status()
     except Exception:
         console.print(f"[red]O proxy não está respondendo em http://localhost:{config.port}[/red]")
-        console.print("Rode [bold]olist-code server[/bold] em outro terminal primeiro.")
+        console.print(
+            "Rode [bold]olist-code[/bold] (ou [bold]olist-code standalone[/bold]) em outro terminal primeiro."
+        )
         raise typer.Exit(code=1)
 
 
@@ -224,37 +226,22 @@ _HARNESS_OPTION = Annotated[
     str | None,
     typer.Option("--harness", help="Which harness to configure: claude, opencode, or both"),
 ]
-_ISOLATED_OPTION = Annotated[
-    bool | None,
-    typer.Option(
-        "--isolated/--no-isolated",
-        help="Leave the global Claude Code settings alone and configure it only through "
-        "`olist-code claude`, so a plain `claude` keeps using your own Anthropic account.",
-    ),
-]
-
-
 @cli.callback(invoke_without_command=True)
-def main_default(
-    ctx: typer.Context,
-    port: _PORT_OPTION = None,
-    harness: _HARNESS_OPTION = None,
-    isolated: _ISOLATED_OPTION = None,
-):
-    """Olist Code Client. Without a subcommand, behaves like `olist-code server`."""
+def main_default(ctx: typer.Context, port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
+    """Start the proxy: logs in and picks a model automatically the first time, then reuses the saved config."""
     if ctx.invoked_subcommand is not None:
         return
-    _run_server(port, harness, isolated)
+    _run_server(port, harness, isolated=False)
 
 
-@cli.command("server")
-def server_command(
-    port: _PORT_OPTION = None,
-    harness: _HARNESS_OPTION = None,
-    isolated: _ISOLATED_OPTION = None,
-):
-    """Start the proxy: logs in and picks a model automatically the first time, then reuses the saved config."""
-    _run_server(port, harness, isolated)
+@cli.command("standalone")
+def standalone_command(port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
+    """Start the proxy without touching the global Claude Code settings.
+
+    A plain `claude` keeps using your own Anthropic account; reach the gateway with
+    `olist-code claude` instead. Also undoes what a previous plain `olist-code` wrote.
+    """
+    _run_server(port, harness, isolated=True)
 
 
 @cli.command(
@@ -281,7 +268,7 @@ def opencode_command(ctx: typer.Context):
     _launch("opencode", ctx.args)
 
 
-def _run_server(port: int | None, harness: str | None, isolated: bool | None = None) -> None:
+def _run_server(port: int | None, harness: str | None, isolated: bool) -> None:
     existing = load_config()
 
     if not (existing and existing.api_key) and load_tokens() is None:
@@ -314,10 +301,9 @@ def _run_server(port: int | None, harness: str | None, isolated: bool | None = N
         tool_format=existing.tool_format if existing else "native",
         port=port or (existing.port if existing else 3080),
         harness=resolved_harness,
-        isolated=isolated if isolated is not None else (existing.isolated if existing else False),
     )
 
-    needs_save = existing is None or (isolated is not None and isolated != existing.isolated)
+    needs_save = existing is None
 
     if not config.models.opus:
         picked = _pick_model(config)
@@ -331,7 +317,7 @@ def _run_server(port: int | None, harness: str | None, isolated: bool | None = N
         save_config(config)
         console.print(f"[green]Config salva em {CONFIG_FILE}[/green]")
 
-    _apply_settings(config)
+    _apply_settings(config, isolated)
 
     from .server import set_app_config
 
@@ -349,8 +335,8 @@ def _run_server(port: int | None, harness: str | None, isolated: bool | None = N
             + f"haiku={config.models.haiku or '—'}\n"
             + "  Claude:    "
             + (
-                "isolado — abra com `olist-code claude`"
-                if config.isolated
+                "standalone — abra com `olist-code claude`"
+                if isolated
                 else "settings.json global — `claude` já aponta pro gateway"
             ),
             title="[bold green]Proxy[/bold green]",
@@ -450,7 +436,7 @@ def config():
     if cfg is None:
         console.print("[yellow]No configuration found.[/yellow]")
         console.print(f"  Config file: {CONFIG_FILE}")
-        console.print("  Run [bold]olist-code server[/bold] to create one.")
+        console.print("  Run [bold]olist-code[/bold] to create one.")
         return
 
     console.print(
@@ -502,7 +488,7 @@ def version():
 
 
 def main() -> None:
-    show_banner = len(sys.argv) <= 1 or sys.argv[1] in ("--help", "-h", "server")
+    show_banner = len(sys.argv) <= 1 or sys.argv[1] in ("--help", "-h", "standalone")
     if show_banner:
         _print_banner()
     cli()

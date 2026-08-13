@@ -63,25 +63,25 @@ class TestApplySettings:
         assert data["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
 
 
-class TestApplySettingsIsolated:
+class TestApplySettingsStandalone:
     @pytest.mark.parametrize("harness", ["claude", "opencode", "both"])
     def test_never_creates_the_global_claude_settings(self, harness, claude_settings_file, opencode_settings_file):
-        cli._apply_settings(make_config(harness=harness, isolated=True))
+        cli._apply_settings(make_config(harness=harness), isolated=True)
 
         assert not claude_settings_file.exists()
 
     def test_opencode_is_configured_either_way(self, claude_settings_file, opencode_settings_file):
-        cli._apply_settings(make_config(harness="both", isolated=True))
+        cli._apply_settings(make_config(harness="both"), isolated=True)
 
         assert opencode_settings_file.exists()
 
-    def test_takes_back_what_a_non_isolated_run_wrote(self, claude_settings_file, opencode_settings_file):
+    def test_takes_back_what_a_plain_run_wrote(self, claude_settings_file, opencode_settings_file):
         claude_settings_file.parent.mkdir(parents=True)
         claude_settings_file.write_text(
             json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://localhost:3080", "OTHER": "1"}})
         )
 
-        cli._apply_settings(make_config(harness="claude", isolated=True))
+        cli._apply_settings(make_config(harness="claude"), isolated=True)
 
         data = json.loads(claude_settings_file.read_text())
         assert data["env"] == {"OTHER": "1"}
