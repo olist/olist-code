@@ -22,6 +22,15 @@ def make_config(**overrides) -> AdapterConfig:
     return AdapterConfig(**defaults)
 
 
+# What versions before the per-process env injection used to write into settings.json.
+_LEGACY_ENV = {
+    "ANTHROPIC_BASE_URL": "http://localhost:3080",
+    "ANTHROPIC_AUTH_TOKEN": "default",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.6",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.5",
+}
+
+
 @pytest.fixture
 def claude_settings_file(tmp_path, monkeypatch):
     path = tmp_path / ".claude" / "settings.json"
@@ -42,27 +51,26 @@ def opencode_settings_file_jsonc(opencode_settings_file):
     return opencode_settings_file.with_suffix(".jsonc")
 
 
-class TestUpdateClaudeSettings:
-    def test_writes_env_vars(self, claude_settings_file):
-        config.update_claude_settings(make_config())
+class TestClaudeEnv:
+    def test_points_at_the_local_proxy(self):
+        env = config.claude_env(make_config())
 
-        data = json.loads(claude_settings_file.read_text())
-        assert data["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
-        assert data["env"]["ANTHROPIC_AUTH_TOKEN"] == "default"
-        assert data["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "glm-4.6"
-        assert data["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "glm-4.5"
-        assert "ANTHROPIC_DEFAULT_HAIKU_MODEL" not in data["env"]
+        assert env["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "default"
+        assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "glm-4.6"
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "glm-4.5"
 
-    def test_preserves_unrelated_keys(self, claude_settings_file):
-        claude_settings_file.parent.mkdir(parents=True)
-        claude_settings_file.write_text(json.dumps({"foo": "bar", "env": {"OTHER": "1"}}))
+    def test_falls_back_when_smaller_models_are_unset(self):
+        env = config.claude_env(make_config(models=ModelConfig(opus="glm-4.6")))
 
-        config.update_claude_settings(make_config())
+        # Without a fallback Claude would ask the gateway for a model it does not serve.
+        assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "glm-4.6"
+        assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "glm-4.6"
 
-        data = json.loads(claude_settings_file.read_text())
-        assert data["foo"] == "bar"
-        assert data["env"]["OTHER"] == "1"
-        assert data["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
+    def test_writes_nothing_to_the_global_settings(self, claude_settings_file):
+        config.claude_env(make_config())
+
+        assert not claude_settings_file.exists()
 
 
 class TestUpdateOpencodeSettings:
@@ -122,9 +130,8 @@ class TestRestoreClaudeSettings:
 
     def test_removes_only_our_keys(self, claude_settings_file):
         claude_settings_file.parent.mkdir(parents=True)
-        claude_settings_file.write_text(json.dumps({"foo": "bar", "env": {"OTHER": "1"}}))
+        claude_settings_file.write_text(json.dumps({"foo": "bar", "env": {"OTHER": "1", **_LEGACY_ENV}}))
 
-        config.update_claude_settings(make_config())
         config.restore_claude_settings()
 
         data = json.loads(claude_settings_file.read_text())
@@ -133,9 +140,8 @@ class TestRestoreClaudeSettings:
 
     def test_drops_env_key_if_it_becomes_empty(self, claude_settings_file):
         claude_settings_file.parent.mkdir(parents=True)
-        claude_settings_file.write_text(json.dumps({"foo": "bar"}))
+        claude_settings_file.write_text(json.dumps({"foo": "bar", "env": dict(_LEGACY_ENV)}))
 
-        config.update_claude_settings(make_config())
         config.restore_claude_settings()
 
         data = json.loads(claude_settings_file.read_text())

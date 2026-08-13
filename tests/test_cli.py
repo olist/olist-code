@@ -42,20 +42,29 @@ class TestApplySettings:
     def test_claude_only_does_not_touch_opencode(self, claude_settings_file, opencode_settings_file):
         cli._apply_settings(make_config(harness="claude"))
 
-        assert claude_settings_file.exists()
         assert not opencode_settings_file.exists()
 
-    def test_opencode_only_does_not_touch_claude(self, claude_settings_file, opencode_settings_file):
+    def test_opencode_only_writes_the_provider(self, claude_settings_file, opencode_settings_file):
         cli._apply_settings(make_config(harness="opencode"))
 
+        assert opencode_settings_file.exists()
+
+    @pytest.mark.parametrize("harness", ["claude", "opencode", "both"])
+    def test_never_creates_the_global_claude_settings(self, harness, claude_settings_file, opencode_settings_file):
+        cli._apply_settings(make_config(harness=harness))
+
         assert not claude_settings_file.exists()
-        assert opencode_settings_file.exists()
 
-    def test_both_touches_both(self, claude_settings_file, opencode_settings_file):
-        cli._apply_settings(make_config(harness="both"))
+    def test_strips_env_vars_left_by_older_versions(self, claude_settings_file, opencode_settings_file):
+        claude_settings_file.parent.mkdir(parents=True)
+        claude_settings_file.write_text(
+            json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://localhost:3080", "OTHER": "1"}})
+        )
 
-        assert claude_settings_file.exists()
-        assert opencode_settings_file.exists()
+        cli._apply_settings(make_config(harness="claude"))
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["env"] == {"OTHER": "1"}
 
 
 class TestResolveHarness:
@@ -75,7 +84,55 @@ class TestResolveHarness:
             cli._resolve_harness("not-a-harness", None)
 
 
-def test_json_dump_smoke(claude_settings_file):
+def test_json_dump_smoke(opencode_settings_file):
     # Sanity check that the fixture path plumbing above actually produces valid JSON.
-    cli._apply_settings(make_config(harness="claude"))
-    json.loads(claude_settings_file.read_text())
+    cli._apply_settings(make_config(harness="opencode"))
+    json.loads(opencode_settings_file.read_text())
+
+
+class TestChildEnv:
+    def test_passes_env_through_when_not_frozen(self, monkeypatch):
+        monkeypatch.delattr(cli.sys, "frozen", raising=False)
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/lib")
+
+        env = cli._child_env({"ANTHROPIC_BASE_URL": "http://localhost:3080"})
+
+        assert env["LD_LIBRARY_PATH"] == "/opt/lib"
+        assert env["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
+
+    def test_drops_pyinstaller_loader_paths_when_frozen(self, monkeypatch):
+        monkeypatch.setattr(cli.sys, "frozen", True, raising=False)
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIabc123")
+        monkeypatch.setenv("_MEIPASS2", "/tmp/_MEIabc123")
+
+        env = cli._child_env()
+
+        assert "LD_LIBRARY_PATH" not in env
+        assert "_MEIPASS2" not in env
+
+    def test_restores_the_users_own_loader_path_when_frozen(self, monkeypatch):
+        monkeypatch.setattr(cli.sys, "frozen", True, raising=False)
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/_MEIabc123")
+        monkeypatch.setenv("LD_LIBRARY_PATH_ORIG", "/opt/lib")
+
+        env = cli._child_env()
+
+        assert env["LD_LIBRARY_PATH"] == "/opt/lib"
+        assert "LD_LIBRARY_PATH_ORIG" not in env
+
+
+class TestRequireConfig:
+    def test_exits_without_a_saved_config(self, monkeypatch):
+        monkeypatch.setattr(cli, "load_config", lambda: None)
+        with pytest.raises(Exception):
+            cli._require_config()
+
+    def test_exits_when_no_model_was_ever_picked(self, monkeypatch):
+        monkeypatch.setattr(cli, "load_config", lambda: make_config(models=ModelConfig(opus="")))
+        with pytest.raises(Exception):
+            cli._require_config()
+
+    def test_returns_the_saved_config(self, monkeypatch):
+        saved = make_config()
+        monkeypatch.setattr(cli, "load_config", lambda: saved)
+        assert cli._require_config() is saved

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import subprocess
 import sys
 from typing import Annotated, Literal, cast
 
+import httpx
 import typer
 from rich.align import Align
 from rich.console import Console
@@ -19,12 +23,12 @@ from .config import (
     CLAUDE_SETTINGS_FILE,
     CONFIG_FILE,
     OPENCODE_SETTINGS_FILE,
+    claude_env,
     load_config,
     restore_claude_settings,
     restore_opencode_settings,
     save_config,
     update_claude_json,
-    update_claude_settings,
     update_opencode_settings,
 )
 from .models import AdapterConfig, ModelConfig, SSOConfig
@@ -61,10 +65,74 @@ def _prompt_harness() -> Harness:
 
 def _apply_settings(config: AdapterConfig) -> None:
     if config.harness in ("claude", "both"):
-        update_claude_settings(config)
+        # Claude Code is configured per-process by `olist-code claude`, so all we do
+        # here is drop the env vars older versions left in the global settings.json.
+        restore_claude_settings()
         update_claude_json()
     if config.harness in ("opencode", "both"):
         update_opencode_settings(config)
+
+
+def _require_config() -> AdapterConfig:
+    cfg = load_config()
+    if cfg is None or not cfg.models.opus:
+        console.print("[red]Nenhuma config encontrada.[/red]")
+        console.print("Rode [bold]olist-code server[/bold] uma vez para fazer login e escolher o modelo.")
+        raise typer.Exit(code=1)
+    return cfg
+
+
+def _require_proxy(config: AdapterConfig) -> None:
+    try:
+        httpx.get(f"http://localhost:{config.port}/health", timeout=2.0).raise_for_status()
+    except Exception:
+        console.print(f"[red]O proxy não está respondendo em http://localhost:{config.port}[/red]")
+        console.print("Rode [bold]olist-code server[/bold] em outro terminal primeiro.")
+        raise typer.Exit(code=1)
+
+
+# Vars PyInstaller rewrites so the frozen binary finds its own bundled libraries. It
+# stashes whatever was there before in <VAR>_ORIG.
+_FROZEN_LOADER_VARS = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "LIBPATH")
+
+
+def _child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Our env plus `extra`, with PyInstaller's loader paths undone.
+
+    Left in place, the child would look for its shared libraries inside our unpacked
+    bundle instead of its own install.
+    """
+    env = {**os.environ, **(extra or {})}
+    if not getattr(sys, "frozen", False):
+        return env
+
+    env.pop("_MEIPASS2", None)
+    for var in _FROZEN_LOADER_VARS:
+        original = env.pop(f"{var}_ORIG", None)
+        if original:
+            env[var] = original
+        else:
+            env.pop(var, None)
+    return env
+
+
+def _launch(command: str, args: list[str], env: dict[str, str] | None = None) -> None:
+    """Run `command` in the foreground, then exit with its status code."""
+    exe = shutil.which(command)
+    if exe is None:
+        console.print(f"[red]`{command}` não encontrado no PATH.[/red]")
+        raise typer.Exit(code=1)
+
+    proc = subprocess.Popen([exe, *args], env=_child_env(env))
+    while True:
+        try:
+            code = proc.wait()
+            break
+        except KeyboardInterrupt:
+            # Ctrl+C already reached the child via the shared process group; it decides
+            # when to exit, and we stay around to report its status.
+            continue
+    raise typer.Exit(code=code)
 
 _OLIST_ART: list[str] = [
     "   ____  ___      __ ",
@@ -147,22 +215,52 @@ def _pick_model(config: AdapterConfig) -> str | None:
     return model_name
 
 
+_PORT_OPTION = Annotated[int | None, typer.Option("--port", "-p", help="Local proxy port")]
+_HARNESS_OPTION = Annotated[
+    str | None,
+    typer.Option("--harness", help="Which harness to configure: claude, opencode, or both"),
+]
+
+
 @cli.callback(invoke_without_command=True)
-def main_default(
-    ctx: typer.Context,
-    port: Annotated[
-        int | None,
-        typer.Option("--port", "-p", help="Local proxy port"),
-    ] = None,
-    harness: Annotated[
-        str | None,
-        typer.Option("--harness", help="Which harness to configure: claude, opencode, or both"),
-    ] = None,
-):
-    """Start the proxy: logs in and picks a model automatically the first time, then reuses the saved config."""
+def main_default(ctx: typer.Context, port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
+    """Olist Code Client. Without a subcommand, behaves like `olist-code server`."""
     if ctx.invoked_subcommand is not None:
         return
+    _run_server(port, harness)
 
+
+@cli.command("server")
+def server_command(port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
+    """Start the proxy: logs in and picks a model automatically the first time, then reuses the saved config."""
+    _run_server(port, harness)
+
+
+@cli.command(
+    "claude",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def claude_command(ctx: typer.Context):
+    """Open Claude Code against the proxy. Any extra args are passed straight to `claude`."""
+    config = _require_config()
+    _require_proxy(config)
+    update_claude_json()
+    _launch("claude", ctx.args, claude_env(config))
+
+
+@cli.command(
+    "opencode",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def opencode_command(ctx: typer.Context):
+    """Open opencode against the proxy. Any extra args are passed straight to `opencode`."""
+    config = _require_config()
+    _require_proxy(config)
+    update_opencode_settings(config)
+    _launch("opencode", ctx.args)
+
+
+def _run_server(port: int | None, harness: str | None) -> None:
     existing = load_config()
 
     if not (existing and existing.api_key) and load_tokens() is None:
@@ -324,7 +422,7 @@ def config():
     if cfg is None:
         console.print("[yellow]No configuration found.[/yellow]")
         console.print(f"  Config file: {CONFIG_FILE}")
-        console.print("  Run [bold]olist-code[/bold] to create one.")
+        console.print("  Run [bold]olist-code server[/bold] to create one.")
         return
 
     console.print(
@@ -376,7 +474,7 @@ def version():
 
 
 def main() -> None:
-    show_banner = len(sys.argv) <= 1 or sys.argv[1] in ("--help", "-h")
+    show_banner = len(sys.argv) <= 1 or sys.argv[1] in ("--help", "-h", "server")
     if show_banner:
         _print_banner()
     cli()

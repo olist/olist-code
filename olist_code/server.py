@@ -75,7 +75,9 @@ async def auth_error_handler(_request: Request, exc: AuthError) -> JSONResponse:
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "version": "2.2.0"}
+    from . import __version__
+
+    return {"status": "ok", "version": __version__}
 
 
 @app.post("/v1/messages")
