@@ -79,12 +79,31 @@ def claude_env(config: AdapterConfig) -> dict[str, str]:
     }
 
 
-def restore_claude_settings() -> None:
-    """Remove the env vars older versions wrote to the global settings.json.
+def update_claude_settings(config: AdapterConfig) -> None:
+    """Point every `claude` at the proxy by writing the env into the global settings.
 
-    Doubles as the migration for anyone still carrying them, and leaves any other
-    settings untouched.
+    Reaches surfaces that never go through `olist-code claude` — the IDE extensions,
+    the desktop app, `claude -p` in scripts — at the cost of taking over the user's
+    plain `claude`. See claude_env() for the opt-out.
     """
+    CLAUDE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict[str, Any] = {}
+    if CLAUDE_SETTINGS_FILE.exists():
+        with open(CLAUDE_SETTINGS_FILE) as f:
+            existing = json.load(f)
+
+    env = existing.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    existing["env"] = {**env, **claude_env(config)}
+
+    with open(CLAUDE_SETTINGS_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+
+
+def restore_claude_settings() -> None:
+    """Undo update_claude_settings(), leaving any other settings untouched."""
     if not CLAUDE_SETTINGS_FILE.exists():
         return
 

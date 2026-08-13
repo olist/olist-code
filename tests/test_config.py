@@ -51,6 +51,44 @@ def opencode_settings_file_jsonc(opencode_settings_file):
     return opencode_settings_file.with_suffix(".jsonc")
 
 
+class TestUpdateClaudeSettings:
+    def test_writes_env_vars(self, claude_settings_file):
+        config.update_claude_settings(make_config())
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
+        assert data["env"]["ANTHROPIC_AUTH_TOKEN"] == "default"
+        assert data["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "glm-4.6"
+        assert data["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "glm-4.5"
+
+    def test_preserves_unrelated_keys(self, claude_settings_file):
+        claude_settings_file.parent.mkdir(parents=True)
+        claude_settings_file.write_text(json.dumps({"foo": "bar", "env": {"OTHER": "1"}}))
+
+        config.update_claude_settings(make_config())
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["foo"] == "bar"
+        assert data["env"]["OTHER"] == "1"
+        assert data["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
+
+    def test_survives_an_env_key_that_is_not_an_object(self, claude_settings_file):
+        claude_settings_file.parent.mkdir(parents=True)
+        claude_settings_file.write_text(json.dumps({"env": "nonsense"}))
+
+        config.update_claude_settings(make_config())
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
+
+    def test_writes_what_the_isolated_mode_would_inject(self, claude_settings_file):
+        # The two modes must configure Claude identically; only the delivery differs.
+        config.update_claude_settings(make_config())
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["env"] == config.claude_env(make_config())
+
+
 class TestClaudeEnv:
     def test_points_at_the_local_proxy(self):
         env = config.claude_env(make_config())

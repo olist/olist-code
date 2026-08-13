@@ -29,6 +29,7 @@ from .config import (
     restore_opencode_settings,
     save_config,
     update_claude_json,
+    update_claude_settings,
     update_opencode_settings,
 )
 from .models import AdapterConfig, ModelConfig, SSOConfig
@@ -65,9 +66,12 @@ def _prompt_harness() -> Harness:
 
 def _apply_settings(config: AdapterConfig) -> None:
     if config.harness in ("claude", "both"):
-        # Claude Code is configured per-process by `olist-code claude`, so all we do
-        # here is drop the env vars older versions left in the global settings.json.
-        restore_claude_settings()
+        if config.isolated:
+            # `olist-code claude` carries the config per-process; drop anything a
+            # previous non-isolated run left behind so plain `claude` comes back.
+            restore_claude_settings()
+        else:
+            update_claude_settings(config)
         update_claude_json()
     if config.harness in ("opencode", "both"):
         update_opencode_settings(config)
@@ -220,20 +224,37 @@ _HARNESS_OPTION = Annotated[
     str | None,
     typer.Option("--harness", help="Which harness to configure: claude, opencode, or both"),
 ]
+_ISOLATED_OPTION = Annotated[
+    bool | None,
+    typer.Option(
+        "--isolated/--no-isolated",
+        help="Leave the global Claude Code settings alone and configure it only through "
+        "`olist-code claude`, so a plain `claude` keeps using your own Anthropic account.",
+    ),
+]
 
 
 @cli.callback(invoke_without_command=True)
-def main_default(ctx: typer.Context, port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
+def main_default(
+    ctx: typer.Context,
+    port: _PORT_OPTION = None,
+    harness: _HARNESS_OPTION = None,
+    isolated: _ISOLATED_OPTION = None,
+):
     """Olist Code Client. Without a subcommand, behaves like `olist-code server`."""
     if ctx.invoked_subcommand is not None:
         return
-    _run_server(port, harness)
+    _run_server(port, harness, isolated)
 
 
 @cli.command("server")
-def server_command(port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
+def server_command(
+    port: _PORT_OPTION = None,
+    harness: _HARNESS_OPTION = None,
+    isolated: _ISOLATED_OPTION = None,
+):
     """Start the proxy: logs in and picks a model automatically the first time, then reuses the saved config."""
-    _run_server(port, harness)
+    _run_server(port, harness, isolated)
 
 
 @cli.command(
@@ -260,7 +281,7 @@ def opencode_command(ctx: typer.Context):
     _launch("opencode", ctx.args)
 
 
-def _run_server(port: int | None, harness: str | None) -> None:
+def _run_server(port: int | None, harness: str | None, isolated: bool | None = None) -> None:
     existing = load_config()
 
     if not (existing and existing.api_key) and load_tokens() is None:
@@ -293,9 +314,10 @@ def _run_server(port: int | None, harness: str | None) -> None:
         tool_format=existing.tool_format if existing else "native",
         port=port or (existing.port if existing else 3080),
         harness=resolved_harness,
+        isolated=isolated if isolated is not None else (existing.isolated if existing else False),
     )
 
-    needs_save = existing is None
+    needs_save = existing is None or (isolated is not None and isolated != existing.isolated)
 
     if not config.models.opus:
         picked = _pick_model(config)
@@ -324,7 +346,13 @@ def _run_server(port: int | None, harness: str | None) -> None:
             + f"  Tool fmt:  {config.tool_format}\n"
             + f"  Models:    opus={config.models.opus}, "
             + f"sonnet={config.models.sonnet or '—'}, "
-            + f"haiku={config.models.haiku or '—'}",
+            + f"haiku={config.models.haiku or '—'}\n"
+            + "  Claude:    "
+            + (
+                "isolado — abra com `olist-code claude`"
+                if config.isolated
+                else "settings.json global — `claude` já aponta pro gateway"
+            ),
             title="[bold green]Proxy[/bold green]",
             border_style="green",
         )
