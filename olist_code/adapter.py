@@ -247,7 +247,7 @@ def _parse_function_args(arguments: str) -> dict[str, Any]:
         return {}
     try:
         return cast(dict[str, Any], json.loads(arguments))
-    except json.JSONDecodeError, TypeError:
+    except (json.JSONDecodeError, TypeError):
         return {"raw": arguments}
 
 
@@ -292,7 +292,9 @@ def build_anthropic_content_block_stop(index: int) -> AnthropicContentBlockStopE
     }
 
 
-def build_anthropic_message_delta(stop_reason: str) -> AnthropicMessageDeltaEvent:
+def build_anthropic_message_delta(
+    stop_reason: str, input_tokens: int = 0, output_tokens: int = 0
+) -> AnthropicMessageDeltaEvent:
     return cast(
         AnthropicMessageDeltaEvent,
         cast(
@@ -300,7 +302,7 @@ def build_anthropic_message_delta(stop_reason: str) -> AnthropicMessageDeltaEven
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": 0},
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
             },
         ),
     )

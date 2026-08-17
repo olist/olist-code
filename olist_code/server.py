@@ -187,6 +187,8 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
     text_block_started = False
     tool_block_index: dict[int, int] = {}
     finish_reason: str | None = None
+    prompt_tokens = 0
+    completion_tokens = 0
 
     yield _sse("message_start", build_anthropic_stream_start())
 
@@ -203,6 +205,11 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
                 openai_chunk = cast(OpenAIStreamChunk, json.loads(data_str))
             except json.JSONDecodeError:
                 continue
+
+            chunk_usage = openai_chunk.get("usage") or {}
+            if chunk_usage:
+                prompt_tokens = int(chunk_usage.get("prompt_tokens") or 0)
+                completion_tokens = int(chunk_usage.get("completion_tokens") or 0)
 
             choices = openai_chunk.get("choices", [])
             if not choices:
@@ -256,7 +263,7 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
             yield _sse("content_block_stop", build_anthropic_content_block_stop(block_idx))
 
         stop_reason = parse_openai_finish_reason(finish_reason)
-        yield _sse("message_delta", build_anthropic_message_delta(stop_reason))
+        yield _sse("message_delta", build_anthropic_message_delta(stop_reason, prompt_tokens, completion_tokens))
         yield _sse("message_stop", build_anthropic_stream_stop())
 
     except Exception as exc:
