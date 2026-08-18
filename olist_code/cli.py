@@ -487,6 +487,21 @@ def version():
     console.print(f"[bold]Olist Code Adapter[/bold] v{__version__}")
 
 
+@cli.command()
+def update():
+    """Download and install the latest olist-code release, replacing this binary."""
+    install_url = "https://raw.githubusercontent.com/olist/olist-code/main/scripts/install.sh"
+    console.print(f"Baixando o instalador de [bold]{install_url}[/bold]...")
+    try:
+        script = httpx.get(install_url, timeout=10.0, follow_redirects=True).raise_for_status().text
+    except Exception as exc:
+        console.print(f"[red]Falha ao baixar o instalador:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    result = subprocess.run(["bash", "-c", script])
+    raise typer.Exit(code=result.returncode)
+
+
 def main() -> None:
     show_banner = len(sys.argv) <= 1 or sys.argv[1] in ("--help", "-h", "standalone")
     if show_banner:

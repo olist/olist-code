@@ -21,11 +21,16 @@ esac
 
 mkdir -p "$INSTALL_DIR"
 dest="$INSTALL_DIR/$BIN_NAME"
+tmp="$dest.download"
 
 echo "Downloading $asset..."
-curl -fsSL "https://github.com/$REPO/releases/latest/download/$asset" -o "$dest"
+curl -fsSL "https://github.com/$REPO/releases/latest/download/$asset" -o "$tmp"
 
-chmod +x "$dest"
+chmod +x "$tmp"
+# mv instead of writing directly to $dest: on Linux, overwriting a binary that's
+# currently running fails with "Text file busy". A rename swaps the directory entry
+# instead, so a running instance keeps its own (now-unlinked) inode until it exits.
+mv "$tmp" "$dest"
 
 echo "Installed $BIN_NAME to $dest"
 case ":$PATH:" in
