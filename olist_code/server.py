@@ -80,6 +80,36 @@ async def health_check():
     return {"status": "ok", "version": __version__}
 
 
+@app.post("/v1/messages/count_tokens")
+async def count_tokens(request: AnthropicRequest):
+    config = _app_config
+    if config is None:
+        raise HTTPException(status_code=503, detail="Adapter not configured.")
+
+    openai_request = anthropic_to_openai(request, config)
+    request_data = {**openai_request.model_dump(exclude_none=True), "max_completion_tokens": 1, "stream": False}
+
+    try:
+        response = await forward_request(config, request_data)
+    except httpx.RequestError as exc:
+        return JSONResponse(status_code=502, content=build_anthropic_error({"error": {"type": "upstream_error", "message": str(exc)}}))
+
+    if response.status_code != 200:
+        try:
+            err: dict[str, object] = response.json()
+        except Exception:
+            err = {"error": {"type": "upstream_error", "message": response.text or f"HTTP {response.status_code}"}}
+        return JSONResponse(status_code=response.status_code, content=build_anthropic_error(err))
+
+    try:
+        data = response.json()
+    except Exception:
+        return JSONResponse(status_code=502, content=build_anthropic_error({"error": {"type": "upstream_error", "message": "Invalid JSON from upstream"}}))
+
+    usage = data.get("usage") or {}
+    return JSONResponse({"input_tokens": int(usage.get("prompt_tokens") or 0)})
+
+
 @app.post("/v1/messages")
 async def proxy_messages(request: AnthropicRequest):
     config = _app_config
