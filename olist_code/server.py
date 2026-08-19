@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, cast
@@ -63,6 +64,24 @@ app = FastAPI(
     version="2.2.0",
     lifespan=lifespan,
 )
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+_access_logger = logging.getLogger("olist_code.access")
+
+
+@app.middleware("http")
+async def log_user_agent(request: Request, call_next):
+    response = await call_next(request)
+    user_agent = request.headers.get("user-agent", "-")
+    _access_logger.info(
+        '"%s %s HTTP/%s" %s user-agent=%r',
+        request.method,
+        request.url.path,
+        request.scope.get("http_version", "1.1"),
+        response.status_code,
+        user_agent,
+    )
+    return response
 
 
 @app.exception_handler(AuthError)
