@@ -34,19 +34,19 @@ class _OpenAIMessageDict(dict[str, Any]):
 
 
 def _block_to_openai(block: AnthropicContentBlock) -> dict[str, Any]:
-    if block.type == "text":
-        return {"type": "text", "text": block.text}
-    if block.type == "tool_use":
+    if block.get("type") == "text":
+        return {"type": "text", "text": block.get("text", "")}
+    if block.get("type") == "tool_use":
         return {
             "type": "function",
-            "id": block.id,
+            "id": str(block.get("id", "")),
             "function": {
-                "name": block.name,
-                "arguments": json.dumps(block.input),
+                "name": str(block.get("name", "")),
+                "arguments": json.dumps(block.get("input", {})),
             },
         }
     text: str
-    content = block.content
+    content = block.get("content")
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
@@ -71,8 +71,8 @@ def _parse_content_for_message(
 ) -> str | list[dict[str, Any]]:
     if isinstance(content, str):
         return content
-    if len(content) == 1 and content[0].type == "text":
-        return content[0].text
+    if len(content) == 1 and content[0].get("type") == "text":
+        return content[0].get("text", "")
     return [_block_to_openai(b) for b in content]
 
 
@@ -102,13 +102,14 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
             else:
                 non_tool_blocks: list[AnthropicContentBlock] = []
                 for block in content:
-                    if block.type == "tool_result":
+                    if block.get("type") == "tool_result":
                         result_text: str
-                        if isinstance(block.content, str):
-                            result_text = block.content
-                        elif isinstance(block.content, list):
+                        block_content = block.get("content")
+                        if isinstance(block_content, str):
+                            result_text = block_content
+                        elif isinstance(block_content, list):
                             result_text = " ".join(
-                                str(c.get("text", "")) for c in block.content
+                                str(c.get("text", "")) for c in block_content
                             )
                         else:
                             result_text = ""
@@ -116,7 +117,7 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
                             _OpenAIMessageDict(
                                 role="tool",
                                 content=result_text,
-                                tool_call_id=block.tool_use_id,
+                                tool_call_id=block.get("tool_use_id"),
                             )
                         )
                     else:
@@ -133,16 +134,16 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
             if isinstance(content, str):
                 other_messages.append(_OpenAIMessageDict(role="assistant", content=content))
             else:
-                tool_use_blocks = [b for b in content if b.type == "tool_use"]
-                text_blocks = [b for b in content if b.type == "text"]
+                tool_use_blocks = [b for b in content if b.get("type") == "tool_use"]
+                text_blocks = [b for b in content if b.get("type") == "text"]
 
                 if tool_use_blocks:
                     tool_calls = [
                         OpenAIToolCall(
-                            id=block.id,
+                            id=str(block.get("id", "")),
                             function={
-                                "name": block.name,
-                                "arguments": json.dumps(block.input),
+                                "name": str(block.get("name", "")),
+                                "arguments": json.dumps(block.get("input", {})),
                             },
                         )
                         for block in tool_use_blocks
@@ -150,12 +151,12 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
                     other_messages.append(
                         _OpenAIMessageDict(
                             role="assistant",
-                            content=text_blocks[0].text if text_blocks else None,
+                            content=text_blocks[0].get("text") if text_blocks else None,
                             tool_calls=tool_calls,
                         )
                     )
                 else:
-                    text = " ".join(b.text for b in text_blocks if b.text)
+                    text = " ".join(b.get("text", "") for b in text_blocks if b.get("text"))
                     other_messages.append(_OpenAIMessageDict(role="assistant", content=text))
 
     system_messages: list[_OpenAIMessageDict] = []

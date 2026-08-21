@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -215,28 +215,10 @@ class AnthropicRole(StrEnum):
     system = "system"
 
 
-class TextBlock(BaseModel):
-    type: Literal["text"]
-    text: str
-
-
-class ToolUseBlock(BaseModel):
-    type: Literal["tool_use"]
-    id: str
-    name: str
-    input: JsonDict
-
-
-class ToolResultBlock(BaseModel):
-    type: Literal["tool_result"]
-    tool_use_id: str
-    content: str | list[JsonDict] | None = None
-
-
-AnthropicContentBlock = Annotated[
-    TextBlock | ToolUseBlock | ToolResultBlock,
-    Field(discriminator="type"),
-]
+type AnthropicContentBlock = JsonDict
+"""A raw Anthropic content block dict (text, tool_use, tool_result, thinking,
+image, or any other block type). Kept untyped/unvalidated so new block types
+Anthropic adds don't cause request validation to reject the whole message."""
 
 
 class AnthropicMessage(BaseModel):
