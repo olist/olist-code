@@ -32,9 +32,6 @@ from olist_code.models import (
     AnthropicToolContentBlock,
     ModelConfig,
     OpenAIResponseChunk,
-    TextBlock,
-    ToolResultBlock,
-    ToolUseBlock,
 )
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -163,7 +160,7 @@ class TestAnthropicToOpenaiContentBlocks:
             messages=[
                 AnthropicMessage(
                     role=AnthropicRole.user,
-                    content=[TextBlock(type="text", text="Resuma esse documento.")],
+                    content=[{"type": "text", "text": "Resuma esse documento."}],
                 )
             ],
         )
@@ -180,8 +177,8 @@ class TestAnthropicToOpenaiContentBlocks:
                 AnthropicMessage(
                     role=AnthropicRole.user,
                     content=[
-                        TextBlock(type="text", text="Resuma esse documento."),
-                        TextBlock(type="text", text="Foque nos pontos principais."),
+                        {"type": "text", "text": "Resuma esse documento."},
+                        {"type": "text", "text": "Foque nos pontos principais."},
                     ],
                 )
             ],
@@ -194,6 +191,38 @@ class TestAnthropicToOpenaiContentBlocks:
         assert len(content) == 2
         assert content[0] == {"type": "text", "text": "Resuma esse documento."}
         assert content[1] == {"type": "text", "text": "Foque nos pontos principais."}
+
+    def test_unknown_block_types_do_not_fail_validation(self, config: AdapterConfig) -> None:
+        """Extended-thinking and image blocks must not 422 the whole request."""
+        req = AnthropicRequest(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role=AnthropicRole.assistant,
+                    content=[
+                        {"type": "thinking", "thinking": "let me think...", "signature": "abc"},
+                        {"type": "text", "text": "Aqui está a resposta."},
+                    ],
+                ),
+                AnthropicMessage(
+                    role=AnthropicRole.user,
+                    content=[
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}},
+                        {"type": "text", "text": "O que tem nessa imagem?"},
+                    ],
+                ),
+            ],
+        )
+        result = anthropic_to_openai(req, config)
+
+        assert len(result.messages) == 2
+        assert result.messages[0].role == "assistant"
+        assert result.messages[0].content == "Aqui está a resposta."
+        assert result.messages[1].role == "user"
+        user_content = result.messages[1].content
+        assert isinstance(user_content, list)
+        assert {"type": "text", "text": "O que tem nessa imagem?"} in user_content
 
 
 # ── Anthropic → OpenAI: multi_turn ───────────────────────────────────────────
@@ -208,7 +237,7 @@ class TestAnthropicToOpenaiMultiTurn:
                 AnthropicMessage(role=AnthropicRole.user, content="Qual é a capital do Brasil?"),
                 AnthropicMessage(
                     role=AnthropicRole.assistant,
-                    content=[TextBlock(type="text", text="A capital do Brasil é Brasília.")],
+                    content=[{"type": "text", "text": "A capital do Brasil é Brasília."}],
                 ),
                 AnthropicMessage(role=AnthropicRole.user, content="E a do Chile?"),
             ],
@@ -305,22 +334,22 @@ class TestAnthropicToOpenaiWithToolResult:
                 AnthropicMessage(
                     role=AnthropicRole.assistant,
                     content=[
-                        ToolUseBlock(
-                            type="tool_use",
-                            id="toolu_01abc123",
-                            name="get_order",
-                            input={"order_id": "12345"},
-                        )
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01abc123",
+                            "name": "get_order",
+                            "input": {"order_id": "12345"},
+                        }
                     ],
                 ),
                 AnthropicMessage(
                     role=AnthropicRole.user,
                     content=[
-                        ToolResultBlock(
-                            type="tool_result",
-                            tool_use_id="toolu_01abc123",
-                            content='{"status": "shipped", "tracking": "BR123456789"}',
-                        )
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_01abc123",
+                            "content": '{"status": "shipped", "tracking": "BR123456789"}',
+                        }
                     ],
                 ),
             ],
