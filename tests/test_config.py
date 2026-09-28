@@ -105,6 +105,13 @@ class TestClaudeEnv:
         assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "glm-4.6"
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "glm-4.6"
 
+    def test_turns_off_the_auto_mode_server_checks(self):
+        env = config.claude_env(make_config())
+
+        # The adapter drops the Anthropic-only fields those checks need; without this,
+        # Claude warns and holds the first auto mode action until the user answers.
+        assert env["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
+
     def test_writes_nothing_to_the_global_settings(self, claude_settings_file):
         config.claude_env(make_config())
 
@@ -165,6 +172,16 @@ class TestRestoreClaudeSettings:
     def test_noop_when_file_missing(self, claude_settings_file):
         config.restore_claude_settings()
         assert not claude_settings_file.exists()
+
+    def test_removes_everything_update_wrote(self, claude_settings_file):
+        claude_settings_file.parent.mkdir(parents=True)
+        claude_settings_file.write_text(json.dumps({"env": {"OTHER": "1"}}))
+        config.update_claude_settings(make_config())
+
+        config.restore_claude_settings()
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["env"] == {"OTHER": "1"}
 
     def test_removes_only_our_keys(self, claude_settings_file):
         claude_settings_file.parent.mkdir(parents=True)

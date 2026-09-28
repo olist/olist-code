@@ -43,6 +43,7 @@ _CLAUDE_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_AUTO_MODE_SERVER",
 )
 
 
@@ -76,6 +77,9 @@ def claude_env(config: AdapterConfig) -> dict[str, str]:
         "ANTHROPIC_DEFAULT_OPUS_MODEL": config.models.opus,
         "ANTHROPIC_DEFAULT_SONNET_MODEL": config.models.sonnet or config.models.opus,
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": config.models.haiku or config.models.sonnet or config.models.opus,
+        # Auto mode's server-side checks need Anthropic-only request/response fields
+        # the adapter can't carry, so skip them instead of warning on every session.
+        "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
     }
 
 
