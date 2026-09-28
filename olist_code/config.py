@@ -45,6 +45,9 @@ _CLAUDE_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 )
 
+# Marks the /model picker rows we write, so restore never drops a lineup the user wrote.
+_MODEL_PICKER_DESCRIPTION = "Olist AI Gateway"
+
 
 def ensure_config_dir() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -79,12 +82,31 @@ def claude_env(config: AdapterConfig) -> dict[str, str]:
     }
 
 
-def update_claude_settings(config: AdapterConfig) -> None:
+def claude_model_picker(model_ids: list[str]) -> dict[str, Any]:
+    """`modelPicker` setting listing the gateway models after Claude Code's built-in rows.
+
+    Claude Code's own gateway discovery keeps only ids containing "claude" or
+    "anthropic", so the gateway's models have to be listed explicitly.
+    """
+    return {"options": [{"model": model_id, "description": _MODEL_PICKER_DESCRIPTION} for model_id in model_ids]}
+
+
+def _is_our_model_picker(picker: Any) -> bool:
+    options = picker.get("options") if isinstance(picker, dict) else None
+    return (
+        isinstance(options, list)
+        and bool(options)
+        and all(isinstance(row, dict) and row.get("description") == _MODEL_PICKER_DESCRIPTION for row in options)
+    )
+
+
+def update_claude_settings(config: AdapterConfig, model_ids: list[str] | None = None) -> None:
     """Point every `claude` at the proxy by writing the env into the global settings.
 
     Reaches surfaces that never go through `olist-code claude` — the IDE extensions,
     the desktop app, `claude -p` in scripts — at the cost of taking over the user's
-    plain `claude`. See claude_env() for the opt-out.
+    plain `claude`. See claude_env() for the opt-out. With `model_ids`, also lists
+    them in the /model picker.
     """
     CLAUDE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -97,6 +119,8 @@ def update_claude_settings(config: AdapterConfig) -> None:
     if not isinstance(env, dict):
         env = {}
     existing["env"] = {**env, **claude_env(config)}
+    if model_ids:
+        existing["modelPicker"] = claude_model_picker(model_ids)
 
     with open(CLAUDE_SETTINGS_FILE, "w") as f:
         json.dump(existing, f, indent=2)
@@ -116,6 +140,9 @@ def restore_claude_settings() -> None:
             env.pop(key, None)
         if not env:
             existing.pop("env", None)
+
+    if _is_our_model_picker(existing.get("modelPicker")):
+        existing.pop("modelPicker")
 
     with open(CLAUDE_SETTINGS_FILE, "w") as f:
         json.dump(existing, f, indent=2)

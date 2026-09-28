@@ -62,6 +62,12 @@ class TestApplySettings:
         data = json.loads(claude_settings_file.read_text())
         assert data["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:3080"
 
+    def test_lists_gateway_models_in_the_picker(self, claude_settings_file):
+        cli._apply_settings(make_config(harness="claude"), model_ids=["glm-4.6", "grok-4"])
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["modelPicker"] == config.claude_model_picker(["glm-4.6", "grok-4"])
+
 
 class TestApplySettingsStandalone:
     @pytest.mark.parametrize("harness", ["claude", "opencode", "both"])
@@ -139,6 +145,36 @@ class TestChildEnv:
 
         assert env["LD_LIBRARY_PATH"] == "/opt/lib"
         assert "LD_LIBRARY_PATH_ORIG" not in env
+
+
+class TestGatewayModelIds:
+    def test_returns_the_gateway_ids(self, monkeypatch):
+        async def fake_fetch(_config):
+            return [{"id": "glm-4.6", "owned_by": "zai"}, {"owned_by": "broken"}, {"id": "grok-4"}]
+
+        monkeypatch.setattr(cli, "fetch_gateway_models", fake_fetch)
+
+        assert cli._gateway_model_ids(make_config()) == ["glm-4.6", "grok-4"]
+
+    def test_empty_when_the_gateway_is_unreachable(self, monkeypatch):
+        # A picker without gateway models is still usable; failing startup over it is not.
+        async def fake_fetch(_config):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(cli, "fetch_gateway_models", fake_fetch)
+
+        assert cli._gateway_model_ids(make_config()) == []
+
+
+class TestClaudeSettingsArgs:
+    def test_passes_the_picker_to_the_session(self):
+        args = cli._claude_settings_args(["glm-4.6", "grok-4"])
+
+        assert args[0] == "--settings"
+        assert json.loads(args[1]) == {"modelPicker": config.claude_model_picker(["glm-4.6", "grok-4"])}
+
+    def test_no_flag_without_gateway_models(self):
+        assert cli._claude_settings_args([]) == []
 
 
 class TestRequireConfig:

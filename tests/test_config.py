@@ -88,6 +88,32 @@ class TestUpdateClaudeSettings:
         data = json.loads(claude_settings_file.read_text())
         assert data["env"] == config.claude_env(make_config())
 
+    def test_lists_gateway_models_in_the_picker(self, claude_settings_file):
+        config.update_claude_settings(make_config(), ["glm-4.6", "grok-4"])
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["modelPicker"] == config.claude_model_picker(["glm-4.6", "grok-4"])
+
+    def test_leaves_the_picker_alone_without_gateway_models(self, claude_settings_file):
+        claude_settings_file.parent.mkdir(parents=True)
+        claude_settings_file.write_text(json.dumps({"modelPicker": {"options": [{"model": "opus"}]}}))
+
+        config.update_claude_settings(make_config())
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["modelPicker"] == {"options": [{"model": "opus"}]}
+
+
+class TestClaudeModelPicker:
+    def test_one_row_per_model_in_gateway_order(self):
+        picker = config.claude_model_picker(["glm-4.6", "grok-4"])
+
+        assert [row["model"] for row in picker["options"]] == ["glm-4.6", "grok-4"]
+
+    def test_keeps_the_built_in_rows(self):
+        # The opus/sonnet/haiku rows are what the saved config maps; hiding them would drop the default.
+        assert "replaceBuiltInOptions" not in config.claude_model_picker(["glm-4.6"])
+
 
 class TestClaudeEnv:
     def test_points_at_the_local_proxy(self):
@@ -184,6 +210,23 @@ class TestRestoreClaudeSettings:
 
         data = json.loads(claude_settings_file.read_text())
         assert data == {"foo": "bar"}
+
+    def test_removes_the_picker_we_wrote(self, claude_settings_file):
+        config.update_claude_settings(make_config(), ["glm-4.6", "grok-4"])
+
+        config.restore_claude_settings()
+
+        data = json.loads(claude_settings_file.read_text())
+        assert "modelPicker" not in data
+
+    def test_keeps_a_picker_the_user_wrote(self, claude_settings_file):
+        claude_settings_file.parent.mkdir(parents=True)
+        claude_settings_file.write_text(json.dumps({"modelPicker": {"options": [{"model": "opus"}]}}))
+
+        config.restore_claude_settings()
+
+        data = json.loads(claude_settings_file.read_text())
+        assert data["modelPicker"] == {"options": [{"model": "opus"}]}
 
 
 class TestRestoreOpencodeSettings:

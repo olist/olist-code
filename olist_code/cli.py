@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from .config import (
     CONFIG_FILE,
     OPENCODE_SETTINGS_FILE,
     claude_env,
+    claude_model_picker,
     load_config,
     restore_claude_settings,
     restore_opencode_settings,
@@ -64,17 +66,33 @@ def _prompt_harness() -> Harness:
     return cast(Harness, ("claude", "opencode", "both")[int(choice.strip()) - 1])
 
 
-def _apply_settings(config: AdapterConfig, isolated: bool = False) -> None:
+def _apply_settings(config: AdapterConfig, isolated: bool = False, model_ids: list[str] | None = None) -> None:
     if config.harness in ("claude", "both"):
         if isolated:
             # `olist-code claude` carries the config per-process; drop anything a
             # previous plain `olist-code` left behind so bare `claude` comes back.
             restore_claude_settings()
         else:
-            update_claude_settings(config)
+            update_claude_settings(config, model_ids)
         update_claude_json()
     if config.harness in ("opencode", "both"):
         update_opencode_settings(config)
+
+
+def _gateway_model_ids(config: AdapterConfig) -> list[str]:
+    try:
+        models = asyncio.run(fetch_gateway_models(config))
+    except Exception as exc:
+        console.print(f"[yellow]Não foi possível buscar modelos do gateway:[/yellow] {exc}")
+        return []
+    return [m["id"] for m in models if m.get("id")]
+
+
+def _claude_settings_args(model_ids: list[str]) -> list[str]:
+    """`claude` flags that list the gateway models in /model for this session only."""
+    if not model_ids:
+        return []
+    return ["--settings", json.dumps({"modelPicker": claude_model_picker(model_ids)})]
 
 
 def _require_config() -> AdapterConfig:
@@ -253,7 +271,7 @@ def claude_command(ctx: typer.Context):
     config = _require_config()
     _require_proxy(config)
     update_claude_json()
-    _launch("claude", ctx.args, claude_env(config))
+    _launch("claude", [*_claude_settings_args(_gateway_model_ids(config)), *ctx.args], claude_env(config))
 
 
 @cli.command(
@@ -317,7 +335,8 @@ def _run_server(port: int | None, harness: str | None, isolated: bool) -> None:
         save_config(config)
         console.print(f"[green]Config salva em {CONFIG_FILE}[/green]")
 
-    _apply_settings(config, isolated)
+    model_ids = _gateway_model_ids(config) if config.harness in ("claude", "both") and not isolated else None
+    _apply_settings(config, isolated, model_ids)
 
     from .server import set_app_config
 
