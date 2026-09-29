@@ -12,29 +12,6 @@ from olist_code import server
 from olist_code.models import AdapterConfig, ModelConfig
 
 
-class _FakeUpstreamResponse:
-    def __init__(self, lines: list[str]) -> None:
-        self._lines = lines
-        self.consumed = 0
-        self.closed = False
-
-    async def aiter_lines(self):
-        for line in self._lines:
-            self.consumed += 1
-            yield line
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
-class _FakeClient:
-    def __init__(self) -> None:
-        self.closed = False
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
 class _FakeJsonResponse:
     status_code = 200
 
@@ -44,23 +21,6 @@ class _FakeJsonResponse:
 
     def json(self) -> dict[str, Any]:
         return self._data
-
-
-def _chunk(text: str | None = None, finish_reason: str | None = None) -> str:
-    delta: dict[str, Any] = {} if text is None else {"content": text}
-    return "data: " + json.dumps({"choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]})
-
-
-def _parse_sse(raw: list[str]) -> list[dict[str, Any]]:
-    events = []
-    for item in raw:
-        data_line = item.split("\n")[1]
-        events.append(json.loads(data_line[len("data: ") :]))
-    return events
-
-
-async def _collect(gen) -> list[str]:
-    return [item async for item in gen]
 
 
 @pytest.fixture
@@ -128,99 +88,3 @@ class TestNonStreamingChatCompletions:
         assert "stop" not in captured["request"]
         assert body["choices"][0]["message"]["content"] == "answer "
         assert body["choices"][0]["finish_reason"] == "stop"
-
-
-class TestStreamingStopSequence:
-    async def test_stops_at_sequence_split_across_chunks(self) -> None:
-        upstream = _FakeUpstreamResponse(
-            [_chunk("<block>no</bl"), _chunk("ock> tail"), _chunk(" more"), _chunk(finish_reason="stop")]
-        )
-        client = _FakeClient()
-        events = _parse_sse(await _collect(server._stream_response(client, upstream, ["</block>"])))
-
-        text = "".join(e["delta"]["text"] for e in events if e["type"] == "content_block_delta")
-        assert text == "<block>no"
-        message_delta = next(e for e in events if e["type"] == "message_delta")
-        assert message_delta["delta"] == {"stop_reason": "stop_sequence", "stop_sequence": "</block>"}
-        assert events[-1]["type"] == "message_stop"
-        assert [e["type"] for e in events].count("content_block_stop") == 1
-        assert upstream.consumed == 2
-        assert upstream.closed and client.closed
-
-    async def test_flushes_held_text_when_no_match(self) -> None:
-        upstream = _FakeUpstreamResponse([_chunk("a</b"), _chunk(finish_reason="stop")])
-        events = _parse_sse(await _collect(server._stream_response(_FakeClient(), upstream, ["</block>"])))
-
-        text = "".join(e["delta"]["text"] for e in events if e["type"] == "content_block_delta")
-        assert text == "a</b"
-        message_delta = next(e for e in events if e["type"] == "message_delta")
-        assert message_delta["delta"] == {"stop_reason": "end_turn", "stop_sequence": None}
-
-
-def _parse_openai_sse(raw: list[str]) -> list[Any]:
-    return [item[len("data: ") :].strip() for item in raw]
-
-
-def _chunks_json(payloads: list[str]) -> list[dict[str, Any]]:
-    return [json.loads(p) for p in payloads if p != "[DONE]"]
-
-
-class TestChatCompletionsStreamingStop:
-    async def test_stops_at_sequence_split_across_chunks(self) -> None:
-        upstream = _FakeUpstreamResponse(
-            [_chunk("answer EN"), _chunk("D ignored"), _chunk(" more"), _chunk(finish_reason="stop"), "data: [DONE]"]
-        )
-        client = _FakeClient()
-        payloads = _parse_openai_sse(await _collect(server._openai_stream_passthrough(client, upstream, ["END"])))
-
-        chunks = _chunks_json(payloads)
-        text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
-        assert text == "answer "
-        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
-        assert payloads[-1] == "[DONE]"
-        assert upstream.consumed == 2
-        assert upstream.closed and client.closed
-
-    async def test_drops_tool_calls_after_match(self) -> None:
-        tool_chunk = "data: " + json.dumps(
-            {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": "xEND", "tool_calls": [{"index": 0, "function": {"name": "t"}}]},
-                        "finish_reason": None,
-                    }
-                ]
-            }
-        )
-        upstream = _FakeUpstreamResponse([tool_chunk])
-        stream = server._openai_stream_passthrough(_FakeClient(), upstream, ["END"])
-        payloads = _parse_openai_sse(await _collect(stream))
-
-        chunks = _chunks_json(payloads)
-        assert all("tool_calls" not in c["choices"][0]["delta"] for c in chunks)
-        assert "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks) == "x"
-
-    async def test_flushes_held_text_when_no_match(self) -> None:
-        upstream = _FakeUpstreamResponse([_chunk("a EN"), _chunk(finish_reason="stop"), "data: [DONE]"])
-        stream = server._openai_stream_passthrough(_FakeClient(), upstream, ["END"])
-        payloads = _parse_openai_sse(await _collect(stream))
-
-        chunks = _chunks_json(payloads)
-        assert "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks) == "a EN"
-        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
-        assert payloads[-1] == "[DONE]"
-
-    async def test_flushes_held_text_at_end_without_finish_chunk(self) -> None:
-        upstream = _FakeUpstreamResponse([_chunk("a EN")])
-        stream = server._openai_stream_passthrough(_FakeClient(), upstream, ["END"])
-        payloads = _parse_openai_sse(await _collect(stream))
-
-        chunks = _chunks_json(payloads)
-        assert "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks) == "a EN"
-
-    async def test_without_stop_passes_bytes_through(self) -> None:
-        raw = _chunk("answer END")
-        upstream = _FakeUpstreamResponse([raw, "data: [DONE]"])
-        out = await _collect(server._openai_stream_passthrough(_FakeClient(), upstream))
-        assert out == [raw + "\n\n", "data: [DONE]\n\n"]

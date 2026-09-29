@@ -13,7 +13,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .adapter import (
-    StopSequenceMatcher,
     anthropic_to_openai,
     build_anthropic_content_block_start_text,
     build_anthropic_content_block_start_tool,
@@ -164,7 +163,7 @@ async def proxy_messages(request: AnthropicRequest):
                     content=build_anthropic_error(error_body_raw),
                 )
             return StreamingResponse(
-                _stream_response(upstream_client, upstream_response, request.stop_sequences),
+                _stream_response(upstream_client, upstream_response),
                 media_type="text/event-stream",
                 headers={
                     "X-Accel-Buffering": "no",
@@ -233,12 +232,7 @@ def _sse(event_type: str, data: object) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
-async def _stream_response(
-    upstream_client: httpx.AsyncClient,
-    upstream_response: httpx.Response,
-    stop_sequences: list[str] | None = None,
-):
-    stop_matcher = StopSequenceMatcher(stop_sequences)
+async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response: httpx.Response):
     content_block_index = 0
     text_block_started = False
     tool_block_index: dict[int, int] = {}
@@ -278,15 +272,11 @@ async def _stream_response(
                 finish_reason = fr
 
             text = delta.get("content")
-            if text:
-                text = stop_matcher.feed(text)
-            if text:
+            if text is not None and text != "":
                 if not text_block_started:
                     yield _sse("content_block_start", build_anthropic_content_block_start_text(content_block_index))
                     text_block_started = True
                 yield _sse("content_block_delta", build_anthropic_text_delta(content_block_index, text))
-            if stop_matcher.matched is not None:
-                break
 
             tool_calls = delta.get("tool_calls", [])
             for tc in tool_calls:
@@ -295,14 +285,6 @@ async def _stream_response(
                 tc_id = tc.get("id")
 
                 if tc_index not in tool_block_index:
-                    held_text = stop_matcher.flush()
-                    if held_text:
-                        if not text_block_started:
-                            yield _sse(
-                                "content_block_start", build_anthropic_content_block_start_text(content_block_index)
-                            )
-                            text_block_started = True
-                        yield _sse("content_block_delta", build_anthropic_text_delta(content_block_index, held_text))
                     if text_block_started:
                         yield _sse("content_block_stop", build_anthropic_content_block_stop(content_block_index))
                         text_block_started = False
@@ -324,24 +306,14 @@ async def _stream_response(
                 if partial_json:
                     yield _sse("content_block_delta", build_anthropic_tool_delta(block_idx, partial_json))
 
-        held_text = stop_matcher.flush()
-        if held_text:
-            if not text_block_started:
-                yield _sse("content_block_start", build_anthropic_content_block_start_text(content_block_index))
-                text_block_started = True
-            yield _sse("content_block_delta", build_anthropic_text_delta(content_block_index, held_text))
-
         if text_block_started:
             yield _sse("content_block_stop", build_anthropic_content_block_stop(content_block_index))
 
         for _, block_idx in sorted(tool_block_index.items()):
             yield _sse("content_block_stop", build_anthropic_content_block_stop(block_idx))
 
-        stop_reason = "stop_sequence" if stop_matcher.matched else parse_openai_finish_reason(finish_reason)
-        yield _sse(
-            "message_delta",
-            build_anthropic_message_delta(stop_reason, prompt_tokens, completion_tokens, stop_matcher.matched),
-        )
+        stop_reason = parse_openai_finish_reason(finish_reason)
+        yield _sse("message_delta", build_anthropic_message_delta(stop_reason, prompt_tokens, completion_tokens))
         yield _sse("message_stop", build_anthropic_stream_stop())
 
     except Exception as exc:
@@ -352,67 +324,16 @@ async def _stream_response(
         await upstream_client.aclose()
 
 
-def _openai_chunk_like(template: dict[str, Any], delta: dict[str, Any], finish_reason: str | None) -> str:
-    chunk = {k: v for k, v in template.items() if k in ("id", "object", "created", "model")}
-    chunk["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
-    return f"data: {json.dumps(chunk)}\n\n"
-
-
-async def _openai_stream_passthrough(
-    upstream_client: httpx.AsyncClient,
-    upstream_response: httpx.Response,
-    stop_sequences: list[str] | None = None,
-):
-    stop_matcher = StopSequenceMatcher(stop_sequences) if stop_sequences else None
-    template: dict[str, Any] = {}
+async def _openai_stream_passthrough(upstream_client: httpx.AsyncClient, upstream_response: httpx.Response):
     try:
         async for line in upstream_response.aiter_lines():
             if not line or line.startswith(":"):
                 continue
-            if not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data == "[DONE]":
-                continue
-            if stop_matcher is None:
+            if line.startswith("data: "):
+                data = line[6:]
+                if data == "[DONE]":
+                    continue
                 yield f"data: {data}\n\n"
-                continue
-            try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                yield f"data: {data}\n\n"
-                continue
-            choices = chunk.get("choices") if isinstance(chunk, dict) else None
-            if not choices:
-                yield f"data: {data}\n\n"
-                continue
-
-            template = chunk
-            choice = choices[0]
-            delta = choice.get("delta") or {}
-            choice["delta"] = delta
-            text = delta.get("content")
-            if text:
-                delta["content"] = stop_matcher.feed(text)
-
-            if stop_matcher.matched is not None:
-                delta.pop("tool_calls", None)
-                if delta.get("content"):
-                    choice["finish_reason"] = None
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                yield _openai_chunk_like(chunk, {}, "stop")
-                break
-
-            if delta.get("tool_calls") or choice.get("finish_reason") is not None:
-                held_text = stop_matcher.flush()
-                if held_text:
-                    delta["content"] = (delta.get("content") or "") + held_text
-            yield f"data: {json.dumps(chunk)}\n\n"
-
-        if stop_matcher is not None:
-            held_text = stop_matcher.flush()
-            if held_text:
-                yield _openai_chunk_like(template, {"content": held_text}, None)
         yield "data: [DONE]\n\n"
     except Exception as exc:
         yield f"data: {json.dumps({'error': {'message': str(exc)}})}\n\n"
@@ -541,7 +462,7 @@ async def proxy_chat_completions(request: Request):
                     }
                 return JSONResponse(status_code=upstream_response.status_code, content=resp_content)
             return StreamingResponse(
-                _openai_stream_passthrough(upstream_client, upstream_response, anthropic_req.stop_sequences),
+                _openai_stream_passthrough(upstream_client, upstream_response),
                 media_type="text/event-stream",
                 headers={
                     "X-Accel-Buffering": "no",
