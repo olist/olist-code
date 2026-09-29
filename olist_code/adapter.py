@@ -179,17 +179,75 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
         stream=request.stream,
         temperature=request.temperature,
         top_p=request.top_p,
-        stop=request.stop_sequences,
         tools=tools,
     )
 
 
-def openai_to_anthropic_response(data: OpenAIResponseChunk) -> AnthropicResponseDict:
+def find_stop_sequence(text: str, stop_sequences: list[str] | None) -> tuple[int, str | None]:
+    best_index = -1
+    matched: str | None = None
+    for seq in stop_sequences or []:
+        if not seq:
+            continue
+        index = text.find(seq)
+        if index != -1 and (best_index == -1 or index < best_index):
+            best_index = index
+            matched = seq
+    return best_index, matched
+
+
+class StopSequenceMatcher:
+    """Incremental stop sequence detection for streamed text.
+
+    Trailing text that could be the start of a stop sequence is held back until
+    the next chunk disambiguates it, so a matched sequence is never emitted.
+    """
+
+    def __init__(self, stop_sequences: list[str] | None) -> None:
+        self._stop_sequences = [s for s in stop_sequences or [] if s]
+        self._pending = ""
+        self.matched: str | None = None
+
+    def feed(self, text: str) -> str:
+        if self.matched is not None:
+            return ""
+        buffer = self._pending + text
+        index, matched = find_stop_sequence(buffer, self._stop_sequences)
+        if matched is not None:
+            self.matched = matched
+            self._pending = ""
+            return buffer[:index]
+        held = self._held_length(buffer)
+        self._pending = buffer[len(buffer) - held :]
+        return buffer[: len(buffer) - held]
+
+    def flush(self) -> str:
+        pending, self._pending = self._pending, ""
+        return pending
+
+    def _held_length(self, buffer: str) -> int:
+        longest = 0
+        for seq in self._stop_sequences:
+            for length in range(min(len(seq) - 1, len(buffer)), longest, -1):
+                if buffer.endswith(seq[:length]):
+                    longest = length
+                    break
+        return longest
+
+
+def openai_to_anthropic_response(
+    data: OpenAIResponseChunk, stop_sequences: list[str] | None = None
+) -> AnthropicResponseDict:
     choices = data.get("choices", [])
     usage = data.get("usage", {})
 
     if not choices:
-        return {"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 0, "output_tokens": 0}}
+        return {
+            "content": [],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
 
     choice = choices[0]
     # Non-streaming responses carry the message under "message"; only
@@ -210,10 +268,17 @@ def openai_to_anthropic_response(data: OpenAIResponseChunk) -> AnthropicResponse
     content_blocks: list[AnthropicResponseTextContent | AnthropicResponseToolContent] = []
 
     text = delta.get("content")
+    tool_calls = delta.get("tool_calls", [])
+    stop_sequence: str | None = None
+    if text:
+        index, stop_sequence = find_stop_sequence(text, stop_sequences)
+        if stop_sequence is not None:
+            text = text[:index]
+            stop_reason = "stop_sequence"
+            tool_calls = []
     if text:
         content_blocks.append({"type": "text", "text": text})
 
-    tool_calls = delta.get("tool_calls", [])
     for tc in tool_calls:
         func = tc.get("function", {})
         content_blocks.append(
@@ -237,6 +302,7 @@ def openai_to_anthropic_response(data: OpenAIResponseChunk) -> AnthropicResponse
             {
                 "content": content_blocks,
                 "stop_reason": stop_reason,
+                "stop_sequence": stop_sequence,
                 "usage": anthropic_usage,
             },
         ),
@@ -294,7 +360,7 @@ def build_anthropic_content_block_stop(index: int) -> AnthropicContentBlockStopE
 
 
 def build_anthropic_message_delta(
-    stop_reason: str, input_tokens: int = 0, output_tokens: int = 0
+    stop_reason: str, input_tokens: int = 0, output_tokens: int = 0, stop_sequence: str | None = None
 ) -> AnthropicMessageDeltaEvent:
     return cast(
         AnthropicMessageDeltaEvent,
@@ -302,7 +368,7 @@ def build_anthropic_message_delta(
             object,
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
                 "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
             },
         ),

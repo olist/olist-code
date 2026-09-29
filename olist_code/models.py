@@ -73,7 +73,7 @@ class AnthropicContentBlockStopEvent(TypedDict):
 
 class AnthropicMessageDeltaStop(TypedDict):
     stop_reason: str
-    stop_sequence: None
+    stop_sequence: str | None
 
 
 class AnthropicMessageDeltaEvent(TypedDict):
@@ -116,6 +116,7 @@ class AnthropicResponseToolContent(TypedDict):
 class AnthropicResponseDict(TypedDict):
     content: list[AnthropicResponseTextContent | AnthropicResponseToolContent]
     stop_reason: str
+    stop_sequence: str | None
     usage: AnthropicUsageDict
 
 
@@ -316,7 +317,6 @@ class OpenAIRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     top_p: float | None = None
-    stop: list[str] | None = None
     tools: list[OpenAITool] | None = None
 
 

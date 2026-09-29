@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 from olist_code.adapter import (
+    StopSequenceMatcher,
     anthropic_to_openai,
     build_anthropic_content_block_start_text,
     build_anthropic_content_block_start_tool,
@@ -573,7 +574,7 @@ class TestEdgeCases:
         assert result.temperature == 0.7
         assert result.top_p == 0.9
 
-    def test_stop_sequences_mapped_to_stop(self, config: AdapterConfig) -> None:
+    def test_stop_sequences_not_forwarded_upstream(self, config: AdapterConfig) -> None:
         req = AnthropicRequest(
             model="claude-sonnet-4-6",
             max_tokens=1024,
@@ -581,7 +582,7 @@ class TestEdgeCases:
             messages=[AnthropicMessage(role=AnthropicRole.user, content="Hello")],
         )
         result = anthropic_to_openai(req, config)
-        assert result.stop == ["\n\nHuman:", "\n\nAssistant:"]
+        assert "stop" not in result.model_dump(exclude_none=True)
 
     def test_assistant_text_only(self, config: AdapterConfig) -> None:
         req = AnthropicRequest(
@@ -616,3 +617,72 @@ class TestEdgeCases:
         result = anthropic_to_openai(req, config)
         assert result.max_completion_tokens == 2048
         assert result.max_tokens == 2048
+
+
+# ── Stop sequence emulation ──────────────────────────────────────────────────
+
+
+def _text_response(text: str) -> OpenAIResponseChunk:
+    return {"choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
+
+
+class TestStopSequenceEmulationNonStreaming:
+    def test_truncates_at_stop_sequence(self) -> None:
+        result = openai_to_anthropic_response(_text_response("<block>no</block> trailing"), ["</block>"])
+        assert result["content"] == [{"type": "text", "text": "<block>no"}]
+        assert result["stop_reason"] == "stop_sequence"
+        assert result["stop_sequence"] == "</block>"
+
+    def test_earliest_stop_sequence_wins(self) -> None:
+        result = openai_to_anthropic_response(_text_response("a END b STOP c"), ["STOP", "END"])
+        assert result["content"] == [{"type": "text", "text": "a "}]
+        assert result["stop_sequence"] == "END"
+
+    def test_no_match_keeps_text_and_stop_reason(self) -> None:
+        result = openai_to_anthropic_response(_text_response("<block>no"), ["</block>"])
+        assert result["content"] == [{"type": "text", "text": "<block>no"}]
+        assert result["stop_reason"] == "end_turn"
+        assert result["stop_sequence"] is None
+
+    def test_match_at_start_yields_no_text_block(self) -> None:
+        result = openai_to_anthropic_response(_text_response("</block>rest"), ["</block>"])
+        assert result["content"] == []
+        assert result["stop_reason"] == "stop_sequence"
+
+    def test_without_stop_sequences_stop_sequence_is_none(self) -> None:
+        result = openai_to_anthropic_response(_text_response("hi"))
+        assert result["stop_sequence"] is None
+
+
+class TestStopSequenceMatcher:
+    def test_passes_text_without_stop_prefix(self) -> None:
+        matcher = StopSequenceMatcher(["</block>"])
+        assert matcher.feed("hello") == "hello"
+        assert matcher.matched is None
+
+    def test_holds_back_possible_prefix(self) -> None:
+        matcher = StopSequenceMatcher(["</block>"])
+        assert matcher.feed("<block>no</bl") == "<block>no"
+        assert matcher.feed("ock> more") == ""
+        assert matcher.matched == "</block>"
+
+    def test_releases_held_text_when_not_a_match(self) -> None:
+        matcher = StopSequenceMatcher(["</block>"])
+        assert matcher.feed("a</b") == "a"
+        assert matcher.feed("r>") == "</br>"
+        assert matcher.matched is None
+
+    def test_flush_returns_held_text(self) -> None:
+        matcher = StopSequenceMatcher(["</block>"])
+        matcher.feed("a</b")
+        assert matcher.flush() == "</b"
+
+    def test_ignores_text_after_match(self) -> None:
+        matcher = StopSequenceMatcher(["END"])
+        assert matcher.feed("xENDy") == "x"
+        assert matcher.feed("more") == ""
+        assert matcher.flush() == ""
+
+    def test_message_delta_carries_stop_sequence(self) -> None:
+        event = build_anthropic_message_delta("stop_sequence", stop_sequence="</block>")
+        assert event["delta"] == {"stop_reason": "stop_sequence", "stop_sequence": "</block>"}
