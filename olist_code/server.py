@@ -232,8 +232,9 @@ def _sse(event_type: str, data: object) -> str:
 
 
 async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response: httpx.Response):
-    content_block_index = 0
-    text_block_started = False
+    next_block_index = 0
+    open_block_index: int | None = None
+    text_block_index: int | None = None
     tool_block_index: dict[int, int] = {}
     finish_reason: str | None = None
     prompt_tokens = 0
@@ -272,10 +273,13 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
 
             text = delta.get("content")
             if text is not None and text != "":
-                if not text_block_started:
-                    yield _sse("content_block_start", build_anthropic_content_block_start_text(content_block_index))
-                    text_block_started = True
-                yield _sse("content_block_delta", build_anthropic_text_delta(content_block_index, text))
+                if text_block_index is None:
+                    if open_block_index is not None:
+                        yield _sse("content_block_stop", build_anthropic_content_block_stop(open_block_index))
+                    text_block_index = open_block_index = next_block_index
+                    next_block_index += 1
+                    yield _sse("content_block_start", build_anthropic_content_block_start_text(text_block_index))
+                yield _sse("content_block_delta", build_anthropic_text_delta(text_block_index, text))
 
             tool_calls = delta.get("tool_calls", [])
             for tc in tool_calls:
@@ -284,12 +288,11 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
                 tc_id = tc.get("id")
 
                 if tc_index not in tool_block_index:
-                    if text_block_started:
-                        yield _sse("content_block_stop", build_anthropic_content_block_stop(content_block_index))
-                        text_block_started = False
-                        content_block_index += 1
-
-                    block_idx = content_block_index
+                    if open_block_index is not None:
+                        yield _sse("content_block_stop", build_anthropic_content_block_stop(open_block_index))
+                    text_block_index = None
+                    block_idx = open_block_index = next_block_index
+                    next_block_index += 1
                     tool_block_index[tc_index] = block_idx
                     yield _sse(
                         "content_block_start",
@@ -305,11 +308,8 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
                 if partial_json:
                     yield _sse("content_block_delta", build_anthropic_tool_delta(block_idx, partial_json))
 
-        if text_block_started:
-            yield _sse("content_block_stop", build_anthropic_content_block_stop(content_block_index))
-
-        for _, block_idx in sorted(tool_block_index.items()):
-            yield _sse("content_block_stop", build_anthropic_content_block_stop(block_idx))
+        if open_block_index is not None:
+            yield _sse("content_block_stop", build_anthropic_content_block_stop(open_block_index))
 
         stop_reason = parse_openai_finish_reason(finish_reason)
         yield _sse("message_delta", build_anthropic_message_delta(stop_reason, prompt_tokens, completion_tokens))
