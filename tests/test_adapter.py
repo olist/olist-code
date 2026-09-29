@@ -577,11 +577,22 @@ class TestEdgeCases:
         req = AnthropicRequest(
             model="claude-sonnet-4-6",
             max_tokens=1024,
+            stream=True,
             stop_sequences=["\n\nHuman:", "\n\nAssistant:"],
             messages=[AnthropicMessage(role=AnthropicRole.user, content="Hello")],
         )
         result = anthropic_to_openai(req, config)
         assert result.stop == ["\n\nHuman:", "\n\nAssistant:"]
+
+    def test_stop_sequences_not_forwarded_when_not_streaming(self, config: AdapterConfig) -> None:
+        req = AnthropicRequest(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            stop_sequences=["\n\nHuman:", "\n\nAssistant:"],
+            messages=[AnthropicMessage(role=AnthropicRole.user, content="Hello")],
+        )
+        result = anthropic_to_openai(req, config)
+        assert "stop" not in result.model_dump(exclude_none=True)
 
     def test_assistant_text_only(self, config: AdapterConfig) -> None:
         req = AnthropicRequest(
@@ -616,3 +627,38 @@ class TestEdgeCases:
         result = anthropic_to_openai(req, config)
         assert result.max_completion_tokens == 2048
         assert result.max_tokens == 2048
+
+
+# ── Stop sequence emulation ──────────────────────────────────────────────────
+
+
+def _text_response(text: str) -> OpenAIResponseChunk:
+    return {"choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
+
+
+class TestStopSequenceEmulationNonStreaming:
+    def test_truncates_at_stop_sequence(self) -> None:
+        result = openai_to_anthropic_response(_text_response("<block>no</block> trailing"), ["</block>"])
+        assert result["content"] == [{"type": "text", "text": "<block>no"}]
+        assert result["stop_reason"] == "stop_sequence"
+        assert result["stop_sequence"] == "</block>"
+
+    def test_earliest_stop_sequence_wins(self) -> None:
+        result = openai_to_anthropic_response(_text_response("a END b STOP c"), ["STOP", "END"])
+        assert result["content"] == [{"type": "text", "text": "a "}]
+        assert result["stop_sequence"] == "END"
+
+    def test_no_match_keeps_text_and_stop_reason(self) -> None:
+        result = openai_to_anthropic_response(_text_response("<block>no"), ["</block>"])
+        assert result["content"] == [{"type": "text", "text": "<block>no"}]
+        assert result["stop_reason"] == "end_turn"
+        assert result["stop_sequence"] is None
+
+    def test_match_at_start_yields_no_text_block(self) -> None:
+        result = openai_to_anthropic_response(_text_response("</block>rest"), ["</block>"])
+        assert result["content"] == []
+        assert result["stop_reason"] == "stop_sequence"
+
+    def test_without_stop_sequences_stop_sequence_is_none(self) -> None:
+        result = openai_to_anthropic_response(_text_response("hi"))
+        assert result["stop_sequence"] is None

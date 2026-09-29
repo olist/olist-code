@@ -23,6 +23,7 @@ from .adapter import (
     build_anthropic_stream_stop,
     build_anthropic_text_delta,
     build_anthropic_tool_delta,
+    find_stop_sequence,
     openai_to_anthropic_response,
     parse_openai_finish_reason,
 )
@@ -201,7 +202,7 @@ async def proxy_messages(request: AnthropicRequest):
                     }
                 ),
             )
-        anthropic_data = openai_to_anthropic_response(cast(OpenAIStreamChunk, openai_data))
+        anthropic_data = openai_to_anthropic_response(cast(OpenAIStreamChunk, openai_data), request.stop_sequences)
 
         return JSONResponse(
             status_code=200,
@@ -341,6 +342,19 @@ async def _openai_stream_passthrough(upstream_client: httpx.AsyncClient, upstrea
         await upstream_client.aclose()
 
 
+def _apply_stop_to_chat_completion(openai_data: dict[str, Any], stop_sequences: list[str] | None) -> None:
+    for choice in openai_data.get("choices") or []:
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        index, matched = find_stop_sequence(content, stop_sequences)
+        if matched is not None:
+            message["content"] = content[:index]
+            message.pop("tool_calls", None)
+            choice["finish_reason"] = "stop"
+
+
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
     config = _app_config
@@ -472,6 +486,7 @@ async def proxy_chat_completions(request: Request):
             openai_data = response.json()
         except Exception:
             raise HTTPException(status_code=502, detail=f"Empty or invalid JSON response (HTTP {response.status_code})")
+        _apply_stop_to_chat_completion(openai_data, anthropic_req.stop_sequences)
         return JSONResponse(status_code=200, content=openai_data)
 
     except httpx.RequestError as exc:
