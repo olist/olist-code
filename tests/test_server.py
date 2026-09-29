@@ -1,4 +1,4 @@
-"""Tests for stop sequence emulation in the proxy routes."""
+"""Tests for the proxy routes: SSE stream building and stop sequence emulation."""
 
 from __future__ import annotations
 
@@ -6,15 +6,14 @@ import json
 from typing import Any, cast
 
 import httpx
-
 import pytest
 from fastapi.testclient import TestClient
 
 from olist_code import server
 from olist_code.models import AdapterConfig, ModelConfig
-from olist_code.server import _stream_response
 
-class FakeUpstreamResponse:
+
+class _FakeUpstreamResponse:
     def __init__(self, chunks: list[dict[str, Any]]) -> None:
         self._lines = [f"data: {json.dumps(c)}" for c in chunks] + ["data: [DONE]"]
         self.closed = False
@@ -27,7 +26,7 @@ class FakeUpstreamResponse:
         self.closed = True
 
 
-class FakeClient:
+class _FakeClient:
     def __init__(self) -> None:
         self.closed = False
 
@@ -54,10 +53,10 @@ def _finish(reason: str) -> dict[str, Any]:
 
 
 async def _collect(chunks: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
-    upstream = FakeUpstreamResponse(chunks)
-    client = FakeClient()
+    upstream = _FakeUpstreamResponse(chunks)
+    client = _FakeClient()
     events: list[tuple[str, dict[str, Any]]] = []
-    async for raw in _stream_response(cast(httpx.AsyncClient, client), cast(httpx.Response, upstream)):
+    async for raw in server._stream_response(cast(httpx.AsyncClient, client), cast(httpx.Response, upstream)):
         event_line, data_line = raw.strip().split("\n")
         events.append((event_line.removeprefix("event: "), json.loads(data_line.removeprefix("data: "))))
     assert upstream.closed
@@ -89,68 +88,67 @@ def _assert_well_formed(events: list[tuple[str, dict[str, Any]]]) -> None:
     assert stopped == started
 
 
-async def test_two_tool_calls_get_distinct_indexes() -> None:
-    events = await _collect(
-        [
-            _tool(0, "call_a", "read", '{"p":'),
-            _tool(0, None, None, '"a"}'),
-            _tool(1, "call_b", "grep", '{"q":"b"}'),
-            _finish("tool_calls"),
+class TestStreaming:
+    async def test_two_tool_calls_get_distinct_indexes(self) -> None:
+        events = await _collect(
+            [
+                _tool(0, "call_a", "read", '{"p":'),
+                _tool(0, None, None, '"a"}'),
+                _tool(1, "call_b", "grep", '{"q":"b"}'),
+                _finish("tool_calls"),
+            ]
+        )
+
+        _assert_well_formed(events)
+        starts = [data for name, data in events if name == "content_block_start"]
+        assert [s["index"] for s in starts] == [0, 1]
+        assert [s["content_block"]["id"] for s in starts] == ["call_a", "call_b"]
+        assert _block_events(events) == [
+            ("content_block_start", 0),
+            ("content_block_delta", 0),
+            ("content_block_delta", 0),
+            ("content_block_stop", 0),
+            ("content_block_start", 1),
+            ("content_block_delta", 1),
+            ("content_block_stop", 1),
         ]
-    )
 
-    _assert_well_formed(events)
-    starts = [data for name, data in events if name == "content_block_start"]
-    assert [s["index"] for s in starts] == [0, 1]
-    assert [s["content_block"]["id"] for s in starts] == ["call_a", "call_b"]
-    assert _block_events(events) == [
-        ("content_block_start", 0),
-        ("content_block_delta", 0),
-        ("content_block_delta", 0),
-        ("content_block_stop", 0),
-        ("content_block_start", 1),
-        ("content_block_delta", 1),
-        ("content_block_stop", 1),
-    ]
+    async def test_text_then_tool(self) -> None:
+        events = await _collect([_text("hi"), _tool(0, "call_a", "read", "{}"), _finish("tool_calls")])
 
+        _assert_well_formed(events)
+        starts = [data for name, data in events if name == "content_block_start"]
+        assert [(s["index"], s["content_block"]["type"]) for s in starts] == [(0, "text"), (1, "tool_use")]
 
-async def test_text_then_tool() -> None:
-    events = await _collect([_text("hi"), _tool(0, "call_a", "read", "{}"), _finish("tool_calls")])
+    async def test_tool_then_text_opens_new_text_block(self) -> None:
+        events = await _collect([_tool(0, "call_a", "read", "{}"), _text("done"), _finish("stop")])
 
-    _assert_well_formed(events)
-    starts = [data for name, data in events if name == "content_block_start"]
-    assert [(s["index"], s["content_block"]["type"]) for s in starts] == [(0, "text"), (1, "tool_use")]
+        _assert_well_formed(events)
+        starts = [data for name, data in events if name == "content_block_start"]
+        assert [(s["index"], s["content_block"]["type"]) for s in starts] == [(0, "tool_use"), (1, "text")]
+        text_deltas = [data for name, data in events if name == "content_block_delta" and data["index"] == 1]
+        assert text_deltas[0]["delta"]["text"] == "done"
 
+    async def test_text_only_reply(self) -> None:
+        events = await _collect([_text("hel"), _text("lo"), _finish("stop")])
 
-async def test_tool_then_text_opens_new_text_block() -> None:
-    events = await _collect([_tool(0, "call_a", "read", "{}"), _text("done"), _finish("stop")])
+        _assert_well_formed(events)
+        assert [name for name, _ in events] == [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+        assert _block_events(events) == [
+            ("content_block_start", 0),
+            ("content_block_delta", 0),
+            ("content_block_delta", 0),
+            ("content_block_stop", 0),
+        ]
 
-    _assert_well_formed(events)
-    starts = [data for name, data in events if name == "content_block_start"]
-    assert [(s["index"], s["content_block"]["type"]) for s in starts] == [(0, "tool_use"), (1, "text")]
-    text_deltas = [data for name, data in events if name == "content_block_delta" and data["index"] == 1]
-    assert text_deltas[0]["delta"]["text"] == "done"
-
-
-async def test_text_only_reply() -> None:
-    events = await _collect([_text("hel"), _text("lo"), _finish("stop")])
-
-    _assert_well_formed(events)
-    assert [name for name, _ in events] == [
-        "message_start",
-        "content_block_start",
-        "content_block_delta",
-        "content_block_delta",
-        "content_block_stop",
-        "message_delta",
-        "message_stop",
-    ]
-    assert _block_events(events) == [
-        ("content_block_start", 0),
-        ("content_block_delta", 0),
-        ("content_block_delta", 0),
-        ("content_block_stop", 0),
-    ]
 
 class _FakeJsonResponse:
     status_code = 200
