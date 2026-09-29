@@ -43,7 +43,7 @@ def captured(monkeypatch: pytest.MonkeyPatch, config: AdapterConfig) -> dict[str
         return _FakeJsonResponse(state["response"])
 
     monkeypatch.setattr(server, "forward_request", fake_forward)
-    server.set_app_config(config)
+    monkeypatch.setattr(server, "_app_config", config)
     return state
 
 
