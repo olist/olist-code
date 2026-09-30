@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from typing import Annotated, Literal, cast
@@ -321,6 +322,8 @@ def _run_server(port: int | None, harness: str | None, isolated: bool) -> None:
         harness=resolved_harness,
     )
 
+    _ensure_port_free(config.port)
+
     needs_save = existing is None
 
     if not config.models.opus:
@@ -365,6 +368,24 @@ def _run_server(port: int | None, harness: str | None, isolated: bool) -> None:
     console.print()
 
     _start_granian(config)
+
+
+def _ensure_port_free(port: int) -> None:
+    """Fail if something already listens on the port.
+
+    Granian binds with SO_REUSEPORT, so a second server would silently share the
+    port with the old one; probing without SO_REUSEPORT detects that.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if os.name != "nt":
+            # Ignore leftover TIME_WAIT connections; still fails on an active listener.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("0.0.0.0", port))
+        except OSError:
+            console.print(f"[red]A porta {port} já está em uso.[/red]")
+            console.print("Encerre o outro proxy (ou processo) usando a porta, ou use [bold]--port[/bold].")
+            raise typer.Exit(code=1)
 
 
 def _start_granian(config: AdapterConfig) -> None:
