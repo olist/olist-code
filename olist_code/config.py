@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .models import AdapterConfig
+from .models import AdapterConfig, ModelConfig
 
 CONFIG_DIR = Path.home() / ".olist-code-adapter"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -68,18 +68,28 @@ def save_config(config: AdapterConfig) -> None:
         json.dump(config.model_dump(), f, indent=2)
 
 
+def claude_family_models(models: ModelConfig) -> dict[str, str]:
+    """Gateway model for each Claude family; unset smaller families fall back to the next one up."""
+    return {
+        "opus": models.opus,
+        "sonnet": models.sonnet or models.opus,
+        "haiku": models.haiku or models.sonnet or models.opus,
+    }
+
+
 def claude_env(config: AdapterConfig) -> dict[str, str]:
     """Env vars that point Claude Code at the local proxy.
 
     Injected into the `olist-code claude` child process instead of being written to
     the user's global settings.json, so a plain `claude` keeps using their own account.
     """
+    family = claude_family_models(config.models)
     return {
         "ANTHROPIC_BASE_URL": f"http://localhost:{config.port}",
         "ANTHROPIC_AUTH_TOKEN": "default",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": config.models.opus,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": config.models.sonnet or config.models.opus,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": config.models.haiku or config.models.sonnet or config.models.opus,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": family["opus"],
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": family["sonnet"],
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": family["haiku"],
         # Auto mode's server-side checks need Anthropic-only request/response fields
         # the adapter can't carry, so skip them instead of warning on every session.
         "CLAUDE_CODE_AUTO_MODE_SERVER": "0",

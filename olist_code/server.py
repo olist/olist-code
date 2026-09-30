@@ -28,7 +28,7 @@ from .adapter import (
     parse_openai_finish_reason,
 )
 from .auth import AuthError
-from .config import load_config
+from .config import claude_family_models, load_config
 from .models import (
     AdapterConfig,
     AnthropicContentBlock,
@@ -49,6 +49,38 @@ _app_config: AdapterConfig | None = None
 def set_app_config(config: AdapterConfig) -> None:
     global _app_config
     _app_config = config
+
+
+# Gateway model ids, fetched on the first Claude-family request; None until a fetch succeeds.
+_gateway_model_ids: set[str] | None = None
+_logger = logging.getLogger("olist_code.server")
+
+
+async def _gateway_models(config: AdapterConfig) -> set[str] | None:
+    global _gateway_model_ids
+    if _gateway_model_ids is None:
+        try:
+            _gateway_model_ids = {m["id"] for m in await fetch_gateway_models(config) if m.get("id")}
+        except Exception as exc:
+            _logger.warning("Could not fetch gateway models, skipping model reroute: %s", exc)
+    return _gateway_model_ids
+
+
+async def _reroute_unknown_claude_model(request: AnthropicRequest, config: AdapterConfig) -> None:
+    """Swap a Claude id the gateway doesn't serve (e.g. `--model claude-opus-5-5`) for its family's model.
+
+    Same mapping as ANTHROPIC_DEFAULT_*_MODEL, which only covers the `opus`/`sonnet`/`haiku` aliases.
+    """
+    lowered = request.model.lower()
+    family = next((f for f in ("opus", "sonnet", "haiku") if f in lowered), None)
+    if family is None:
+        return
+    known = await _gateway_models(config)
+    if known is None or request.model in known:
+        return
+    target = claude_family_models(config.models)[family]
+    _logger.info("Rerouting unknown model %s to %s", request.model, target)
+    request.model = target
 
 
 @asynccontextmanager
@@ -106,6 +138,7 @@ async def count_tokens(request: AnthropicRequest):
     if config is None:
         raise HTTPException(status_code=503, detail="Adapter not configured.")
 
+    await _reroute_unknown_claude_model(request, config)
     openai_request = anthropic_to_openai(request, config)
     request_data = {**openai_request.model_dump(exclude_none=True), "max_completion_tokens": 1, "stream": False}
 
@@ -139,6 +172,7 @@ async def proxy_messages(request: AnthropicRequest):
             detail="Adapter not configured. Run --init first.",
         )
 
+    await _reroute_unknown_claude_model(request, config)
     try:
         openai_request = anthropic_to_openai(request, config)
         request_data = openai_request.model_dump(exclude_none=True)
@@ -493,4 +527,4 @@ async def proxy_chat_completions(request: Request):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-from .proxy import forward_request, open_upstream_stream  # noqa: E402
+from .proxy import fetch_gateway_models, forward_request, open_upstream_stream  # noqa: E402

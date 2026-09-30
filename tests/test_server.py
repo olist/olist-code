@@ -226,3 +226,74 @@ class TestNonStreamingChatCompletions:
         assert "stop" not in captured["request"]
         assert body["choices"][0]["message"]["content"] == "answer "
         assert body["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.fixture
+def gateway_models(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    state: dict[str, Any] = {"ids": ["claude-sonnet-4-6", "glm-4.6"], "calls": 0, "fail": False}
+
+    async def fake_fetch(_config: AdapterConfig) -> list[dict[str, Any]]:
+        state["calls"] += 1
+        if state["fail"]:
+            raise httpx.ConnectError("gateway down")
+        return [{"id": model_id} for model_id in state["ids"]]
+
+    monkeypatch.setattr(server, "fetch_gateway_models", fake_fetch)
+    monkeypatch.setattr(server, "_gateway_model_ids", None)
+    return state
+
+
+def _send(model: str, path: str = "/v1/messages") -> None:
+    TestClient(server.app).post(
+        path, json={"model": model, "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}
+    )
+
+
+class TestUnknownClaudeModelReroute:
+    @pytest.mark.parametrize(
+        ("requested", "expected"),
+        [
+            ("claude-opus-5-5", "claude-sonnet-4-20250514"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-6"),
+            # haiku is unset in the config, so it falls back to sonnet like ANTHROPIC_DEFAULT_HAIKU_MODEL does.
+            ("claude-haiku-4-5", "claude-sonnet-4-6"),
+        ],
+    )
+    def test_unknown_claude_id_goes_to_the_family_model(
+        self, captured: dict[str, Any], gateway_models: dict[str, Any], requested: str, expected: str
+    ) -> None:
+        captured["response"] = _openai_text("ok")
+        _send(requested)
+        assert captured["request"]["model"] == expected
+
+    def test_known_claude_id_passes_through(self, captured: dict[str, Any], gateway_models: dict[str, Any]) -> None:
+        captured["response"] = _openai_text("ok")
+        _send("claude-sonnet-4-6")
+        assert captured["request"]["model"] == "claude-sonnet-4-6"
+
+    def test_unknown_non_claude_id_passes_through(
+        self, captured: dict[str, Any], gateway_models: dict[str, Any]
+    ) -> None:
+        captured["response"] = _openai_text("ok")
+        _send("gpt-9")
+        assert captured["request"]["model"] == "gpt-9"
+        assert gateway_models["calls"] == 0
+
+    def test_passes_through_when_the_list_cannot_be_fetched(
+        self, captured: dict[str, Any], gateway_models: dict[str, Any]
+    ) -> None:
+        gateway_models["fail"] = True
+        captured["response"] = _openai_text("ok")
+        _send("claude-opus-5-5")
+        assert captured["request"]["model"] == "claude-opus-5-5"
+
+    def test_fetches_the_gateway_list_once(self, captured: dict[str, Any], gateway_models: dict[str, Any]) -> None:
+        captured["response"] = _openai_text("ok")
+        _send("claude-opus-5-5")
+        _send("claude-opus-5-5")
+        assert gateway_models["calls"] == 1
+
+    def test_count_tokens_is_rerouted_too(self, captured: dict[str, Any], gateway_models: dict[str, Any]) -> None:
+        captured["response"] = {"usage": {"prompt_tokens": 5}}
+        _send("claude-opus-5-5", "/v1/messages/count_tokens")
+        assert captured["request"]["model"] == "claude-sonnet-4-20250514"
