@@ -116,6 +116,7 @@ class AnthropicResponseToolContent(TypedDict):
 class AnthropicResponseDict(TypedDict):
     content: list[AnthropicResponseTextContent | AnthropicResponseToolContent]
     stop_reason: str
+    stop_sequence: str | None
     usage: AnthropicUsageDict
 
 

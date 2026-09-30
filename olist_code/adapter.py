@@ -179,17 +179,38 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
         stream=request.stream,
         temperature=request.temperature,
         top_p=request.top_p,
-        stop=request.stop_sequences,
+        # Non-streaming replies are cut by the proxy; gateway grok models reject `stop`.
+        stop=request.stop_sequences if request.stream else None,
         tools=tools,
     )
 
 
-def openai_to_anthropic_response(data: OpenAIResponseChunk) -> AnthropicResponseDict:
+def find_stop_sequence(text: str, stop_sequences: list[str] | None) -> tuple[int, str | None]:
+    best_index = -1
+    matched: str | None = None
+    for seq in stop_sequences or []:
+        if not seq:
+            continue
+        index = text.find(seq)
+        if index != -1 and (best_index == -1 or index < best_index):
+            best_index = index
+            matched = seq
+    return best_index, matched
+
+
+def openai_to_anthropic_response(
+    data: OpenAIResponseChunk, stop_sequences: list[str] | None = None
+) -> AnthropicResponseDict:
     choices = data.get("choices", [])
     usage = data.get("usage", {})
 
     if not choices:
-        return {"content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 0, "output_tokens": 0}}
+        return {
+            "content": [],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
 
     choice = choices[0]
     # Non-streaming responses carry the message under "message"; only
@@ -210,10 +231,17 @@ def openai_to_anthropic_response(data: OpenAIResponseChunk) -> AnthropicResponse
     content_blocks: list[AnthropicResponseTextContent | AnthropicResponseToolContent] = []
 
     text = delta.get("content")
+    tool_calls = delta.get("tool_calls", [])
+    stop_sequence: str | None = None
+    if text:
+        index, stop_sequence = find_stop_sequence(text, stop_sequences)
+        if stop_sequence is not None:
+            text = text[:index]
+            stop_reason = "stop_sequence"
+            tool_calls = []
     if text:
         content_blocks.append({"type": "text", "text": text})
 
-    tool_calls = delta.get("tool_calls", [])
     for tc in tool_calls:
         func = tc.get("function", {})
         content_blocks.append(
@@ -237,6 +265,7 @@ def openai_to_anthropic_response(data: OpenAIResponseChunk) -> AnthropicResponse
             {
                 "content": content_blocks,
                 "stop_reason": stop_reason,
+                "stop_sequence": stop_sequence,
                 "usage": anthropic_usage,
             },
         ),
