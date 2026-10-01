@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import socket
 
 import pytest
+import typer
 
 from olist_code import cli, config
 from olist_code.models import AdapterConfig, ModelConfig
@@ -192,3 +194,25 @@ class TestRequireConfig:
         saved = make_config()
         monkeypatch.setattr(cli, "load_config", lambda: saved)
         assert cli._require_config() is saved
+
+
+class TestEnsurePortFree:
+    def test_exits_when_another_server_listens_with_reuseport(self):
+        # granian binds with SO_REUSEPORT, so a second granian would silently share the port.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as other:
+            other.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            other.bind(("0.0.0.0", 0))
+            other.listen()
+            port = other.getsockname()[1]
+
+            with pytest.raises(typer.Exit) as exc:
+                cli._ensure_port_free(port)
+
+        assert exc.value.exit_code == 1
+
+    def test_passes_when_port_is_free(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("0.0.0.0", 0))
+            port = probe.getsockname()[1]
+
+        cli._ensure_port_free(port)
