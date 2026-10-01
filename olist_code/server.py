@@ -44,6 +44,8 @@ from .models import (
     JsonDict,
     OpenAIChatCompletionsRequest,
     OpenAIChoiceChunk,
+    OpenAIMessage,
+    OpenAIRole,
     OpenAIStreamChunk,
     OpenAIToolDef,
 )
@@ -109,6 +111,8 @@ _UPSTREAM_PATH = "/v1/chat/completions"
 _ERROR_BODY_LIMIT = 2000
 _INVALID_JSON_LIMIT = 500
 _SHAPE_DETAILED_MESSAGES = 10
+_TOOL_IDS_LISTED = 8
+_TOOL_ORPHANS_LISTED = 3
 
 
 @dataclass
@@ -120,6 +124,7 @@ class _RequestLog:
     stream: bool = False
     request: AnthropicRequest | None = None
     upstream_messages: int | None = None
+    upstream_history: list[OpenAIMessage] | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     error: str | None = None
@@ -177,13 +182,69 @@ def _request_shape(
     return " ".join(parts)
 
 
+def _id_list(ids: list[str], limit: int = _TOOL_IDS_LISTED) -> str:
+    listed = ",".join(ids[:limit])
+    return f"{listed},…(+{len(ids) - limit})" if len(ids) > limit else listed
+
+
+def _tool_id_check(messages: list[OpenAIMessage]) -> str:
+    """Tool call/result pairing of the messages sent upstream, ids only.
+
+    A tool message must answer a call of the assistant message opening its run of tool messages.
+    """
+    orphans: list[str] = []
+    unanswered: list[str] = []
+    call_counts: Counter[str] = Counter()
+    run_position: int | None = None
+    run_calls: list[str] = []
+    run_results: list[str] = []
+    last_run = ""
+    last_results: list[str] = []
+
+    def close_run() -> None:
+        missing = [i for i in run_calls if i not in run_results]
+        if missing:
+            unanswered.append(f"unanswered@{run_position}[{_id_list(missing)}]")
+
+    for position, message in enumerate(messages):
+        if message.role == OpenAIRole.tool:
+            tool_call_id = str(message.tool_call_id)
+            run_results.append(tool_call_id)
+            if tool_call_id not in run_calls:
+                orphans.append(f"orphan@{position}:{tool_call_id} avail[{_id_list(run_calls)}]")
+            continue
+        close_run()
+        run_results = []
+        if message.role == OpenAIRole.assistant and message.tool_calls:
+            run_position, run_calls = position, [c.id for c in message.tool_calls]
+            call_counts.update(run_calls)
+            last_run, last_results = f"last_calls@{position}[{_id_list(run_calls)}]", run_results
+        else:
+            run_position, run_calls = None, []
+    close_run()
+
+    problems = orphans[:_TOOL_ORPHANS_LISTED]
+    if len(orphans) > _TOOL_ORPHANS_LISTED:
+        problems.append(f"orphans+{len(orphans) - _TOOL_ORPHANS_LISTED}")
+    duplicates = [f"{i}×{n}" for i, n in call_counts.items() if n > 1]
+    if duplicates:
+        problems.append(f"dup[{_id_list(duplicates)}]")
+    problems.extend(unanswered[:_TOOL_ORPHANS_LISTED])
+    parts = [f"tool_ids={' '.join(problems)}" if problems else "tool_ids=ok"]
+    if last_run:
+        parts.append(f"{last_run} results[{_id_list(last_results)}]")
+    return " ".join(parts)
+
+
 def _log_upstream_status(entry: _RequestLog, status: int, body: str) -> None:
+    tool_ids = f" {_tool_id_check(entry.upstream_history)}" if entry.upstream_history is not None else ""
     _logger.warning(
-        "Upstream returned HTTP %s for upstream_model=%s: %s | %s",
+        "Upstream returned HTTP %s for upstream_model=%s: %s | %s%s",
         status,
         entry.upstream_model,
         _truncate(body, _ERROR_BODY_LIMIT) or "<empty body>",
         entry.shape(),
+        tool_ids,
     )
 
 
@@ -296,7 +357,7 @@ async def count_tokens(request: AnthropicRequest):
     await _reroute_unknown_claude_model(request, config)
     entry.upstream_model = request.model
     openai_request = anthropic_to_openai(request, config)
-    entry.upstream_messages = len(openai_request.messages)
+    entry.upstream_messages, entry.upstream_history = len(openai_request.messages), openai_request.messages
     request_data = {**openai_request.model_dump(exclude_none=True), "max_completion_tokens": 1, "stream": False}
 
     try:
@@ -339,7 +400,7 @@ async def proxy_messages(request: AnthropicRequest):
     entry.upstream_model = request.model
     try:
         openai_request = anthropic_to_openai(request, config)
-        entry.upstream_messages = len(openai_request.messages)
+        entry.upstream_messages, entry.upstream_history = len(openai_request.messages), openai_request.messages
         request_data = openai_request.model_dump(exclude_none=True)
 
         if request.stream:
@@ -443,6 +504,9 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
     open_block_index: int | None = None
     text_block_index: int | None = None
     tool_block_index: dict[int, int] = {}
+    tool_ids: dict[int, str] = {}
+    tool_names: dict[int, str] = {}
+    late_arg_indexes: set[int] = set()
     finish_reason: str | None = None
     prompt_tokens = 0
     completion_tokens = 0
@@ -502,6 +566,23 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
                 func = tc.get("function", {})
                 tc_id = tc.get("id")
 
+                if tc_id:
+                    other_index = next((i for i, known in tool_ids.items() if known == tc_id and i != tc_index), None)
+                    if other_index is not None:
+                        _logger.warning(
+                            "Stream tool call id %s at index %d already used at index %d",
+                            tc_id,
+                            tc_index,
+                            other_index,
+                        )
+                    elif tc_index in tool_ids and tool_ids[tc_index] != tc_id:
+                        _logger.warning(
+                            "Stream tool call at index %d changed id from %s to %s",
+                            tc_index,
+                            tool_ids[tc_index],
+                            tc_id,
+                        )
+
                 if tc_index not in tool_block_index:
                     if open_block_index is not None:
                         yield _sse("content_block_stop", build_anthropic_content_block_stop(open_block_index))
@@ -509,23 +590,38 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
                     block_idx = open_block_index = next_block_index
                     next_block_index += 1
                     tool_block_index[tc_index] = block_idx
+                    if not tc_id:
+                        tc_id = f"toolu_{uuid.uuid4().hex[:24]}"
+                        _logger.warning(
+                            "Stream tool call at index %d started without an id, generated %s", tc_index, tc_id
+                        )
+                    tool_ids[tc_index] = tc_id
+                    tool_names[tc_index] = func.get("name", "unknown_tool")
                     yield _sse(
                         "content_block_start",
-                        build_anthropic_content_block_start_tool(
-                            block_idx,
-                            tc_id or f"toolu_{uuid.uuid4().hex[:24]}",
-                            func.get("name", "unknown_tool"),
-                        ),
+                        build_anthropic_content_block_start_tool(block_idx, tc_id, tool_names[tc_index]),
                     )
 
                 block_idx = tool_block_index[tc_index]
                 partial_json = func.get("arguments", "")
                 if partial_json:
+                    # Still emitted to the closed block, as before; logged once per index to spot interleaved calls.
+                    if block_idx != open_block_index and tc_index not in late_arg_indexes:
+                        late_arg_indexes.add(tc_index)
+                        _logger.warning(
+                            "Stream argument delta for tool index %d arrived after its block %d was closed",
+                            tc_index,
+                            block_idx,
+                        )
                     yield _sse("content_block_delta", build_anthropic_tool_delta(block_idx, partial_json))
 
         if open_block_index is not None:
             yield _sse("content_block_stop", build_anthropic_content_block_stop(open_block_index))
 
+        _logger.debug(
+            "Stream emitted tool_use blocks: %s",
+            " ".join(f"{tool_block_index[i]}:{tool_ids[i]}:{tool_names[i]}" for i in tool_block_index) or "none",
+        )
         if finish_reason == "content_filter":
             _logger.warning("Upstream stopped the stream with finish_reason=content_filter")
         if next_block_index == 0 or finish_reason is None:

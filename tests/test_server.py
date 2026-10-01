@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from olist_code import server
-from olist_code.models import AdapterConfig, ModelConfig
+from olist_code.models import AdapterConfig, ModelConfig, OpenAIMessage, OpenAIRole, OpenAIToolCall
 
 
 class _FakeUpstreamResponse:
@@ -486,6 +486,66 @@ class TestStreamLogging:
         assert "event: error" in events[-1]
         assert any("ReadError" in m for m in _messages(caplog, "olist_code.server", logging.WARNING))
 
+    async def test_id_change_at_same_index_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        await _collect([_tool(0, "call_a", "read", "{"), _tool(0, "call_x", None, "}"), _finish("tool_calls")])
+
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "index 0" in line
+        assert "call_a" in line
+        assert "call_x" in line
+
+    async def test_same_id_at_two_indexes_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        await _collect([_tool(0, "call_a", "read", "{}"), _tool(1, "call_a", "grep", "{}"), _finish("tool_calls")])
+
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "call_a" in line
+        assert "index 1" in line
+        assert "index 0" in line
+
+    async def test_tool_without_id_logs_generated_id(self, caplog: pytest.LogCaptureFixture) -> None:
+        events = await _collect([_tool(0, None, "read", "{}"), _finish("tool_calls")])
+
+        [start] = [data for name, data in events if name == "content_block_start"]
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "index 0" in line
+        assert start["content_block"]["id"] in line
+
+    async def test_args_for_closed_block_are_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        await _collect(
+            [
+                _tool(0, "call_a", "read", '{"p":'),
+                _tool(1, "call_b", "grep", '{"q":"b"}'),
+                _tool(0, None, None, '"a"}'),
+                _finish("tool_calls"),
+            ]
+        )
+
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "index 0" in line
+        assert "closed" in line
+        assert '"a"' not in line
+
+    async def test_parallel_tool_calls_log_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        await _collect(
+            [
+                _tool(0, "call_a", "read", "{"),
+                _tool(0, "call_a", None, "}"),
+                _tool(1, "call_b", "grep", "{}"),
+                _finish("tool_calls"),
+            ]
+        )
+
+        assert _messages(caplog, "olist_code.server", logging.WARNING) == []
+
+    async def test_emitted_tool_blocks_are_logged_at_debug(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.DEBUG)
+
+        await _collect([_text("hi"), _tool(0, "call_a", "read", '{"p":"secret"}'), _tool(1, "call_b", "grep", "{}")])
+
+        [line] = [m for m in _messages(caplog, "olist_code.server") if "tool_use" in m]
+        assert "1:call_a:read 2:call_b:grep" in line
+        assert "secret" not in line
+
 
 class TestRequestSummary:
     def test_one_summary_line_per_request(self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture) -> None:
@@ -579,3 +639,92 @@ class TestRequestShape:
         assert "msgs=50" in shape
         assert shape.count("user[text×1]") == 10
         assert "text×50" in shape
+
+
+def _assistant(*ids: str) -> OpenAIMessage:
+    return OpenAIMessage(
+        role=OpenAIRole.assistant,
+        content="secret plan",
+        tool_calls=[OpenAIToolCall(id=i, function={"name": "read", "arguments": '{"p":"secret"}'}) for i in ids],
+    )
+
+
+def _result(tool_call_id: str) -> OpenAIMessage:
+    return OpenAIMessage(role=OpenAIRole.tool, content="secret output", tool_call_id=tool_call_id)
+
+
+def _plain(role: str) -> OpenAIMessage:
+    return OpenAIMessage(role=OpenAIRole(role), content="secret text")
+
+
+class TestToolIdCheck:
+    def test_paired_conversation_is_ok(self) -> None:
+        check = server._tool_id_check(
+            [
+                _plain("system"),
+                _plain("user"),
+                _assistant("a"),
+                _result("a"),
+                _assistant("b", "c"),
+                _result("b"),
+                _result("c"),
+            ]
+        )
+
+        assert "tool_ids=ok" in check
+        assert "last_calls@4[b,c] results[b,c]" in check
+        assert "secret" not in check
+
+    def test_result_not_in_preceding_calls_is_reported(self) -> None:
+        check = server._tool_id_check([_plain("user"), _assistant("a", "b"), _result("a"), _result("x")])
+
+        assert "tool_ids=ok" not in check
+        assert "orphan@3:x avail[a,b]" in check
+        assert "unanswered@1[b]" in check
+
+    def test_result_after_run_ended_is_orphan(self) -> None:
+        check = server._tool_id_check([_assistant("a"), _plain("user"), _result("a")])
+
+        assert "orphan@2:a avail[]" in check
+        assert "unanswered@0[a]" in check
+
+    def test_duplicate_call_ids_are_reported(self) -> None:
+        check = server._tool_id_check([_assistant("a"), _result("a"), _assistant("a"), _result("a")])
+
+        assert "dup[a×2]" in check
+
+    def test_long_id_lists_are_truncated(self) -> None:
+        ids = [f"id{n}" for n in range(30)]
+        check = server._tool_id_check([_assistant(*ids), *[_result(i) for i in ids]])
+
+        assert "id29" not in check
+        assert "+" in check
+
+    def test_no_tool_calls(self) -> None:
+        assert server._tool_id_check([_plain("user"), _plain("assistant")]) == "tool_ids=ok"
+
+
+class TestUpstreamErrorToolIds:
+    def test_upstream_error_includes_tool_id_check(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        upstream["response"] = _FakeRawResponse(400, json.dumps({"message": "tool_call_id not found"}))
+
+        _post(
+            messages=[
+                {"role": "user", "content": _SECRET_PROMPT},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call_a", "name": "read", "input": {"p": _SECRET_PROMPT}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call_z", "content": _SECRET_PROMPT}],
+                },
+            ]
+        )
+
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "orphan@2:call_z avail[call_a]" in line
+        assert "last_calls@1[call_a] results[call_z]" in line
+        assert _SECRET_PROMPT not in line
