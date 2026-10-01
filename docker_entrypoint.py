@@ -33,6 +33,6 @@ if __name__ == "__main__":
         workers=1,
         interface=Interfaces.ASGI,
         log_level=LogLevels(granian_log_level(log_level)),
-        log_dictconfig=build_log_config(log_level),
+        log_dictconfig=build_log_config(log_level, log_file=None),
         log_access=False,
     ).serve()

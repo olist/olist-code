@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 from contextvars import ContextVar
 from pathlib import Path
@@ -38,17 +39,43 @@ def granian_log_level(level: int) -> str:
     return logging.getLevelName(max(level, logging.INFO)).lower()
 
 
+class SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Granian's parent and worker (and other proxies) append to the same file: reopen it when
+    another process rotated it, so nobody keeps writing to the renamed backup. Logs may carry
+    sensitive data, so the file is kept private."""
+
+    def _open(self):
+        stream = super()._open()
+        os.chmod(self.baseFilename, 0o600)
+        return stream
+
+    def shouldRollover(self, record: logging.LogRecord) -> bool:
+        if self.stream is not None and self._rotated_elsewhere():
+            self.stream.close()
+            self.stream = self._open()
+        return super().shouldRollover(record)
+
+    def _rotated_elsewhere(self) -> bool:
+        try:
+            current = os.stat(self.baseFilename)
+        except FileNotFoundError:
+            return True
+        opened = os.fstat(self.stream.fileno())
+        return (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+
+
 def _file_is_writable(log_file: Path) -> bool:
     try:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         with open(log_file, "a"):
             pass
+        log_file.chmod(0o600)
     except OSError:
         return False
     return True
 
 
-def build_log_config(level: int, log_file: Path = LOG_FILE) -> dict[str, Any]:
+def build_log_config(level: int, log_file: Path | None = LOG_FILE) -> dict[str, Any]:
     """A dictConfig, handed to Granian so each worker process applies it on start."""
     handlers: dict[str, Any] = {
         "console": {
@@ -58,9 +85,9 @@ def build_log_config(level: int, log_file: Path = LOG_FILE) -> dict[str, Any]:
             "filters": ["request_id"],
         },
     }
-    if _file_is_writable(log_file):
+    if log_file is not None and _file_is_writable(log_file):
         handlers["file"] = {
-            "class": "logging.handlers.RotatingFileHandler",
+            "class": SharedRotatingFileHandler,
             "filename": str(log_file),
             "maxBytes": 5 * 1024 * 1024,
             "backupCount": 3,

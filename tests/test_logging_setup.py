@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import logging.config
+import os
 
 import pytest
 
@@ -80,6 +81,63 @@ class TestBuildLogConfig:
 
         assert "file" not in config["handlers"]
         assert config["root"]["handlers"] == ["console"]
+
+    def test_no_file_handler_when_log_file_is_none(self) -> None:
+        config = logging_setup.build_log_config(logging.INFO, log_file=None)
+
+        assert "file" not in config["handlers"]
+        assert config["root"]["handlers"] == ["console"]
+
+    def test_existing_log_file_is_made_private(self, tmp_path) -> None:
+        log_file = tmp_path / "olist-code.log"
+        log_file.write_text("")
+        log_file.chmod(0o644)
+
+        logging_setup.build_log_config(logging.INFO, log_file)
+
+        assert log_file.stat().st_mode & 0o777 == 0o600
+
+
+class TestSharedRotatingFileHandler:
+    def _handler(self, log_file, max_bytes: int = 0):
+        handler = logging_setup.SharedRotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        return handler
+
+    def _record(self, msg: str) -> logging.LogRecord:
+        return logging.LogRecord("t", logging.INFO, __file__, 1, msg, None, None)
+
+    def test_rotated_files_are_private(self, tmp_path) -> None:
+        log_file = tmp_path / "olist-code.log"
+        handler = self._handler(log_file, max_bytes=20)
+        try:
+            for i in range(5):
+                handler.emit(self._record(f"line number {i}"))
+        finally:
+            handler.close()
+
+        files = [log_file, *tmp_path.glob("olist-code.log.*")]
+        assert len(files) > 1
+        assert all(f.stat().st_mode & 0o777 == 0o600 for f in files)
+
+    def test_reopens_after_another_process_rotated_the_file(self, tmp_path) -> None:
+        log_file = tmp_path / "olist-code.log"
+        handler = self._handler(log_file)
+        try:
+            handler.emit(self._record("before"))
+            os.rename(log_file, tmp_path / "olist-code.log.1")
+            log_file.write_text("")
+            handler.emit(self._record("after"))
+        finally:
+            handler.close()
+
+        assert log_file.read_text() == "after\n"
+        assert (tmp_path / "olist-code.log.1").read_text() == "before\n"
+
+    def test_build_log_config_uses_shared_handler(self, tmp_path) -> None:
+        config = logging_setup.build_log_config(logging.INFO, tmp_path / "olist-code.log")
+
+        assert config["handlers"]["file"]["class"] is logging_setup.SharedRotatingFileHandler
 
 
 class TestGranianLevel:

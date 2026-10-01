@@ -70,7 +70,7 @@ olist-code standalone --log-level warning
 OLIST_CODE_LOG_LEVEL=debug olist-code
 ```
 
-A flag tem prioridade sobre a variável de ambiente; sem nenhuma, o nível é `info`. No Docker, use `OLIST_CODE_LOG_LEVEL`.
+A flag tem prioridade sobre a variável de ambiente; sem nenhuma, o nível é `info`. No Docker, use `OLIST_CODE_LOG_LEVEL`; lá o log vai só pro terminal (sem arquivo).
 
 Quando algo dá errado, o log mostra o motivo: status e corpo do erro do gateway (truncado), timeouts e falhas de conexão (tipo do erro e tempo decorrido), erros no meio do streaming, respostas cortadas por filtro de conteúdo, e o traceback de erros internos. Junto vai o formato da requisição — quantidade de mensagens, tipos de bloco por mensagem, número de tools, `max_tokens`, tamanho do corpo.
 
