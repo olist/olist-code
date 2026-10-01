@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import socket
 
 import pytest
 import typer
+from typer.testing import CliRunner
 
 from olist_code import cli, config
 from olist_code.models import AdapterConfig, ModelConfig
@@ -216,3 +218,64 @@ class TestEnsurePortFree:
             port = probe.getsockname()[1]
 
         cli._ensure_port_free(port)
+
+
+class TestLogLevelOptions:
+    @pytest.fixture
+    def run_server(self, monkeypatch):
+        calls = []
+        monkeypatch.delenv("OLIST_CODE_LOG_LEVEL", raising=False)
+        monkeypatch.setattr(cli, "_run_server", lambda port, harness, isolated, log_level: calls.append(log_level))
+        return calls
+
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            ([], logging.INFO),
+            (["--debug"], logging.DEBUG),
+            (["--log-level", "warning"], logging.WARNING),
+            (["standalone", "--debug"], logging.DEBUG),
+            (["standalone", "--log-level", "error"], logging.ERROR),
+        ],
+    )
+    def test_server_commands_resolve_the_level(self, run_server, args, expected):
+        result = CliRunner().invoke(cli.cli, args)
+
+        assert result.exit_code == 0, result.output
+        assert run_server == [expected]
+
+    def test_env_is_used_without_flags(self, run_server, monkeypatch):
+        monkeypatch.setenv("OLIST_CODE_LOG_LEVEL", "warning")
+
+        CliRunner().invoke(cli.cli, ["standalone"])
+
+        assert run_server == [logging.WARNING]
+
+    def test_unknown_level_exits(self, run_server):
+        result = CliRunner().invoke(cli.cli, ["--log-level", "loud"])
+
+        assert result.exit_code == 1
+        assert run_server == []
+
+
+class TestStartGranian:
+    def test_disables_granian_access_log_and_uses_our_logging(self, monkeypatch, tmp_path):
+        import granian
+
+        captured = {}
+
+        class FakeGranian:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+
+            def serve(self):
+                pass
+
+        monkeypatch.setattr(granian, "Granian", FakeGranian)
+        monkeypatch.setattr(cli, "LOG_FILE", tmp_path / "olist-code.log")
+
+        cli._start_granian(make_config(), logging.DEBUG)
+
+        assert captured["log_access"] is False
+        assert captured["log_level"] == "info"
+        assert captured["log_dictconfig"]["root"]["level"] == logging.DEBUG

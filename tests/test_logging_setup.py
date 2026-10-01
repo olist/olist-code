@@ -1,0 +1,91 @@
+"""Tests for log level resolution and the logging config handed to Granian."""
+
+from __future__ import annotations
+
+import logging
+import logging.config
+
+import pytest
+
+from olist_code import logging_setup
+
+
+@pytest.fixture(autouse=True)
+def no_env_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OLIST_CODE_LOG_LEVEL", raising=False)
+
+
+@pytest.fixture
+def restore_logging():
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    yield
+    for handler in root.handlers:
+        if handler not in handlers:
+            handler.close()
+    root.handlers[:] = handlers
+    root.setLevel(level)
+
+
+class TestResolveLogLevel:
+    def test_defaults_to_info(self) -> None:
+        assert logging_setup.resolve_log_level(None, debug=False) == logging.INFO
+
+    def test_reads_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OLIST_CODE_LOG_LEVEL", "warning")
+        assert logging_setup.resolve_log_level(None, debug=False) == logging.WARNING
+
+    def test_flag_wins_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OLIST_CODE_LOG_LEVEL", "debug")
+        assert logging_setup.resolve_log_level("ERROR", debug=False) == logging.ERROR
+
+    def test_debug_shortcut_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OLIST_CODE_LOG_LEVEL", "error")
+        assert logging_setup.resolve_log_level(None, debug=True) == logging.DEBUG
+
+    def test_rejects_unknown_level(self) -> None:
+        with pytest.raises(ValueError, match="verbose"):
+            logging_setup.resolve_log_level("verbose", debug=False)
+
+
+class TestBuildLogConfig:
+    def test_writes_formatted_lines_with_request_id_to_the_file(self, tmp_path, restore_logging) -> None:
+        log_file = tmp_path / "logs" / "olist-code.log"
+        logging.config.dictConfig(logging_setup.build_log_config(logging.INFO, log_file))
+
+        token = logging_setup.request_id.set("ab12cd")
+        try:
+            logging.getLogger("olist_code.server").error("upstream failed")
+        finally:
+            logging_setup.request_id.reset(token)
+        logging.getLogger("olist_code.server").info("no request")
+
+        lines = log_file.read_text().splitlines()
+        assert lines[0].endswith(" ERROR olist_code.server [req=ab12cd] upstream failed")
+        assert lines[1].endswith(" INFO olist_code.server no request")
+
+    def test_level_filters_lower_records(self, tmp_path, restore_logging) -> None:
+        log_file = tmp_path / "olist-code.log"
+        logging.config.dictConfig(logging_setup.build_log_config(logging.WARNING, log_file))
+
+        logging.getLogger("olist_code.server").info("hidden")
+
+        assert "hidden" not in log_file.read_text()
+
+    def test_skips_file_when_dir_cannot_be_created(self, tmp_path) -> None:
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+
+        config = logging_setup.build_log_config(logging.INFO, blocker / "logs" / "olist-code.log")
+
+        assert "file" not in config["handlers"]
+        assert config["root"]["handlers"] == ["console"]
+
+
+class TestGranianLevel:
+    @pytest.mark.parametrize(
+        ("level", "expected"),
+        [(logging.DEBUG, "info"), (logging.INFO, "info"), (logging.WARNING, "warning"), (logging.ERROR, "error")],
+    )
+    def test_never_goes_below_info(self, level: int, expected: str) -> None:
+        assert logging_setup.granian_log_level(level) == expected

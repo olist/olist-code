@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, cast
 
 import httpx
@@ -297,3 +298,284 @@ class TestUnknownClaudeModelReroute:
         captured["response"] = {"usage": {"prompt_tokens": 5}}
         _send("claude-opus-5-5", "/v1/messages/count_tokens")
         assert captured["request"]["model"] == "claude-sonnet-4-20250514"
+
+
+class _FakeRawResponse:
+    def __init__(self, status_code: int, text: str) -> None:
+        self.status_code = status_code
+        self.text = text
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+class _FakeStreamResponse(_FakeUpstreamResponse):
+    status_code = 200
+
+
+_SECRET_PROMPT = "my confidential prompt text"
+
+
+def _post(path: str = "/v1/messages", stream: bool = False, **extra: Any) -> httpx.Response:
+    return TestClient(server.app, raise_server_exceptions=False).post(
+        path,
+        json={
+            "model": "grok-4.6",
+            "max_tokens": 64,
+            "stream": stream,
+            "messages": [{"role": "user", "content": _SECRET_PROMPT}],
+            **extra,
+        },
+    )
+
+
+@pytest.fixture
+def upstream(monkeypatch: pytest.MonkeyPatch, config: AdapterConfig) -> dict[str, Any]:
+    state: dict[str, Any] = {"response": _FakeRawResponse(200, json.dumps(_openai_text("ok"))), "chunks": []}
+
+    async def fake_forward(_config: AdapterConfig, _request_data: dict[str, Any]) -> Any:
+        if isinstance(state["response"], Exception):
+            raise state["response"]
+        return state["response"]
+
+    async def fake_open_stream(_config: AdapterConfig, _request_data: dict[str, Any]) -> Any:
+        return _FakeClient(), _FakeStreamResponse(state["chunks"])
+
+    monkeypatch.setattr(server, "forward_request", fake_forward)
+    monkeypatch.setattr(server, "open_upstream_stream", fake_open_stream)
+    monkeypatch.setattr(server, "_app_config", config)
+    return state
+
+
+def _messages(caplog: pytest.LogCaptureFixture, logger: str, level: int = logging.DEBUG) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == logger and r.levelno >= level]
+
+
+class TestErrorLogging:
+    def test_upstream_error_logs_status_body_and_shape(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        upstream["response"] = _FakeRawResponse(400, json.dumps({"detail": "model grok-4.6 not allowed"}))
+
+        resp = _post()
+
+        assert resp.status_code == 400
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "400" in line
+        assert "model grok-4.6 not allowed" in line
+        assert "upstream_model=grok-4.6" in line
+        assert "user[text×1]" in line
+
+    def test_upstream_error_body_is_truncated(self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture) -> None:
+        upstream["response"] = _FakeRawResponse(500, "x" * 10_000)
+
+        _post()
+
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert len(line) < 3_000
+
+    def test_request_error_logs_exception_class(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        upstream["response"] = httpx.ReadTimeout("")
+
+        resp = _post()
+
+        assert resp.status_code == 502
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "ReadTimeout" in line
+        assert "/v1/chat/completions" in line
+
+    def test_invalid_json_logs_status_and_text(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        upstream["response"] = _FakeRawResponse(200, "<html>gateway hiccup</html>")
+
+        resp = _post()
+
+        assert resp.status_code == 502
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "gateway hiccup" in line
+
+    def test_unexpected_exception_logs_traceback_and_shape(
+        self, upstream: dict[str, Any], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def boom(*_args: Any) -> Any:
+            raise ValueError("conversion failed")
+
+        monkeypatch.setattr(server, "anthropic_to_openai", boom)
+
+        resp = _post()
+
+        assert resp.status_code == 500
+        [record] = [r for r in caplog.records if r.name == "olist_code.server" and r.levelno >= logging.ERROR]
+        assert record.exc_info is not None
+        assert "user[text×1]" in record.getMessage()
+
+    def test_count_tokens_upstream_error_is_logged(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        upstream["response"] = _FakeRawResponse(429, json.dumps({"detail": "slow down"}))
+
+        _post("/v1/messages/count_tokens")
+
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "429" in line
+        assert "slow down" in line
+
+    def test_chat_completions_upstream_error_is_logged(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        upstream["response"] = _FakeRawResponse(400, json.dumps({"detail": "bad tools"}))
+
+        _post("/v1/chat/completions")
+
+        [line] = _messages(caplog, "olist_code.server", logging.WARNING)
+        assert "bad tools" in line
+
+    def test_logs_never_contain_prompt_or_token(
+        self, upstream: dict[str, Any], config: AdapterConfig, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+        config.api_key = "sk-very-secret-token"
+        upstream["response"] = _FakeRawResponse(400, json.dumps({"detail": "nope"}))
+
+        _post()
+        upstream["response"] = httpx.ConnectError("refused")
+        _post()
+
+        assert caplog.records
+        assert _SECRET_PROMPT not in caplog.text
+        assert "sk-very-secret-token" not in caplog.text
+
+
+class TestStreamLogging:
+    async def test_error_chunk_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        await _collect([_text("hi"), {"error": {"message": "rate limited upstream"}}])
+
+        assert any("rate limited upstream" in m for m in _messages(caplog, "olist_code.server", logging.WARNING))
+
+    async def test_content_filter_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        await _collect([_text("hi"), _finish("content_filter")])
+
+        assert any("content_filter" in m for m in _messages(caplog, "olist_code.server", logging.WARNING))
+
+    async def test_empty_stream_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        await _collect([])
+
+        assert any("no content" in m for m in _messages(caplog, "olist_code.server", logging.WARNING))
+
+    async def test_normal_stream_logs_no_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        await _collect([_text("hi"), _finish("stop")])
+
+        assert _messages(caplog, "olist_code.server", logging.WARNING) == []
+
+    async def test_exception_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        class _Broken(_FakeUpstreamResponse):
+            async def aiter_lines(self):
+                yield f"data: {json.dumps(_text('hi'))}"
+                raise httpx.ReadError("")
+
+        events = [
+            raw
+            async for raw in server._stream_response(
+                cast(httpx.AsyncClient, _FakeClient()), cast(httpx.Response, _Broken([]))
+            )
+        ]
+
+        assert "event: error" in events[-1]
+        assert any("ReadError" in m for m in _messages(caplog, "olist_code.server", logging.WARNING))
+
+
+class TestRequestSummary:
+    def test_one_summary_line_per_request(self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO)
+
+        _post()
+
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "POST /v1/messages" in line
+        assert "grok-4.6" in line
+        assert "stream=no" in line
+        assert "status=200" in line
+        assert "ms" in line
+        assert "in=3 out=4" in line
+
+    def test_stream_summary_reflects_mid_stream_error(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        upstream["chunks"] = [_text("hi"), {"error": {"message": "overloaded"}}]
+
+        _post(stream=True)
+
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "stream=yes" in line
+        assert "status=200" in line
+        assert "error=" in line
+
+    def test_stream_summary_has_tokens(self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO)
+        upstream["chunks"] = [_text("hi"), {**_finish("stop"), "usage": {"prompt_tokens": 7, "completion_tokens": 2}}]
+
+        _post(stream=True)
+
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "in=7 out=2" in line
+        assert "error=" not in line
+
+    def test_health_is_not_logged_at_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO)
+
+        TestClient(server.app).get("/health")
+
+        assert _messages(caplog, "olist_code.access", logging.INFO) == []
+
+
+class TestRequestShape:
+    def test_counts_blocks_per_message_without_content(self) -> None:
+        request = server.AnthropicRequest.model_validate(
+            {
+                "model": "m",
+                "max_tokens": 10,
+                "system": [{"type": "text", "text": "sys"}],
+                "tools": [{"name": "read", "input_schema": {}}],
+                "messages": [
+                    {"role": "user", "content": "hello there"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "x"},
+                            {"type": "tool_use", "id": "1", "name": "read", "input": {"p": "secret"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "1", "content": "data"}] * 3,
+                    },
+                ],
+            }
+        )
+
+        shape = server._request_shape(request, body_bytes=1234, upstream_messages=5)
+
+        assert "msgs=3" in shape
+        assert "user[text×1] assistant[text×1,tool_use×1] user[tool_result×3]" in shape
+        assert "system=1" in shape
+        assert "tools=1" in shape
+        assert "max_tokens=10" in shape
+        assert "body=1234B" in shape
+        assert "upstream_msgs=5" in shape
+        assert "hello" not in shape
+        assert "secret" not in shape
+
+    def test_long_conversations_are_summarized(self) -> None:
+        request = server.AnthropicRequest.model_validate(
+            {"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "x"}] * 50}
+        )
+
+        shape = server._request_shape(request)
+
+        assert "msgs=50" in shape
+        assert shape.count("user[text×1]") == 10
+        assert "text×50" in shape

@@ -57,3 +57,21 @@ Tudo depois do nome do harness vai direto pra ele: `olist-code claude --resume`.
 | `olist-code version` | Print the installed olist-code version. |
 
 Use `olist-code --help` para a lista completa.
+
+## Logs e depuração
+
+O proxy escreve no terminal e em `~/.olist-code-adapter/logs/olist-code.log` (rotaciona a cada 5 MB, guarda 3 arquivos antigos). Cada linha tem horário, nível e um id curto da requisição (`[req=ab12cd]`), pra juntar tudo que aconteceu numa mesma chamada.
+
+Por padrão sai uma linha por requisição: endpoint, modelo pedido → modelo no gateway, se foi streaming, status final, duração e tokens. Pra ver mais (ou menos):
+
+```bash
+olist-code --debug                 # atalho pra --log-level debug
+olist-code standalone --log-level warning
+OLIST_CODE_LOG_LEVEL=debug olist-code
+```
+
+A flag tem prioridade sobre a variável de ambiente; sem nenhuma, o nível é `info`. No Docker, use `OLIST_CODE_LOG_LEVEL`.
+
+Quando algo dá errado, o log mostra o motivo: status e corpo do erro do gateway (truncado), timeouts e falhas de conexão (tipo do erro e tempo decorrido), erros no meio do streaming, respostas cortadas por filtro de conteúdo, e o traceback de erros internos. Junto vai o formato da requisição — quantidade de mensagens, tipos de bloco por mensagem, número de tools, `max_tokens`, tamanho do corpo.
+
+O proxy nunca registra o conteúdo dos prompts, as entradas de ferramentas, headers ou tokens de acesso. A única coisa copiada do gateway é a mensagem de erro que ele devolve, truncada.
