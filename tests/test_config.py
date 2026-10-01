@@ -131,6 +131,16 @@ class TestClaudeEnv:
         assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "glm-4.6"
         assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "glm-4.6"
 
+    def test_family_models_match_the_env_defaults(self):
+        cfg = make_config(models=ModelConfig(opus="glm-4.6"))
+        env = config.claude_env(cfg)
+
+        assert config.claude_family_models(cfg.models) == {
+            "opus": env["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            "sonnet": env["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "haiku": env["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+        }
+
     def test_turns_off_the_auto_mode_server_checks(self):
         env = config.claude_env(make_config())
 
