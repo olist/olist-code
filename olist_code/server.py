@@ -7,9 +7,11 @@ import logging
 import time
 import uuid
 from collections import Counter
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
@@ -127,6 +129,8 @@ class _RequestLog:
     upstream_history: list[OpenAIMessage] | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cached_tokens: int | None = None
+    cost: float | None = None
     error: str | None = None
 
     def elapsed_ms(self) -> int:
@@ -144,6 +148,60 @@ _request_log: ContextVar[_RequestLog | None] = ContextVar("olist_code_request_lo
 def _current_log() -> _RequestLog:
     """The log entry of the request being served; a throwaway one outside a request."""
     return _request_log.get() or _RequestLog()
+
+
+def _record_usage(entry: _RequestLog, usage: Mapping[str, Any]) -> None:
+    """Copy an OpenAI usage block into the log entry; a missing or invalid `cost` counts as 0."""
+    entry.input_tokens = int(usage.get("prompt_tokens") or 0)
+    entry.output_tokens = int(usage.get("completion_tokens") or 0)
+    entry.cached_tokens = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    try:
+        entry.cost = float(usage.get("cost") or 0)
+    except (TypeError, ValueError):
+        entry.cost = 0.0
+
+
+_COST_COMMENT = ": cost="
+
+
+def _record_stream_cost(entry: _RequestLog, line: str) -> None:
+    """Read the `: cost=<usd>` comment the gateway appends after `data: [DONE]`."""
+    if line.startswith(_COST_COMMENT):
+        try:
+            entry.cost = float(line.removeprefix(_COST_COMMENT))
+        except ValueError:
+            pass
+
+
+@dataclass
+class _ModelStats:
+    requests: int = 0
+    errors: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    cost: float = 0.0
+    duration_ms: int = 0
+
+
+# Usage since this process started, per upstream model. Granian runs a single worker and
+# _record_stats never awaits, so no lock is needed.
+_stats: dict[str, _ModelStats] = {}
+_stats_started = datetime.now(UTC)
+
+
+def _record_stats(status: int, entry: _RequestLog) -> None:
+    if entry.upstream_model is None:
+        return
+    stats = _stats.setdefault(entry.upstream_model, _ModelStats())
+    stats.requests += 1
+    if status >= 400 or entry.error:
+        stats.errors += 1
+    stats.input_tokens += entry.input_tokens or 0
+    stats.output_tokens += entry.output_tokens or 0
+    stats.cached_tokens += entry.cached_tokens or 0
+    stats.cost += entry.cost or 0.0
+    stats.duration_ms += entry.elapsed_ms()
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -280,7 +338,9 @@ def _log_summary(method: str, path: str, status: int, entry: _RequestLog) -> Non
     parts.append(f"{entry.elapsed_ms()}ms")
     if entry.input_tokens is not None or entry.output_tokens is not None:
         parts.append(f"in={entry.input_tokens or 0} out={entry.output_tokens or 0}")
-    if path == "/health":
+    if entry.cost is not None:
+        parts.append(f"cached={entry.cached_tokens or 0} cost={entry.cost:.6f}")
+    if path in ("/health", "/olist/stats"):
         level = logging.DEBUG
     elif status >= 400 or entry.error:
         level = logging.WARNING
@@ -324,6 +384,7 @@ class _RequestLogMiddleware:
             raise
         finally:
             _log_summary(scope["method"], scope["path"], status, entry)
+            _record_stats(status, entry)
             _request_log.reset(log_token)
             request_id.reset(id_token)
 
@@ -344,6 +405,11 @@ async def health_check():
     from . import __version__
 
     return {"status": "ok", "version": __version__}
+
+
+@app.get("/olist/stats")
+async def usage_stats():
+    return {"started_at": _stats_started.isoformat(), "models": {name: asdict(s) for name, s in _stats.items()}}
 
 
 @app.post("/v1/messages/count_tokens")
@@ -380,8 +446,7 @@ async def count_tokens(request: AnthropicRequest):
         _log_invalid_json(response.status_code, response.text)
         return JSONResponse(status_code=502, content=build_anthropic_error({"error": {"type": "upstream_error", "message": "Invalid JSON from upstream"}}))
 
-    usage = data.get("usage") or {}
-    entry.input_tokens = int(usage.get("prompt_tokens") or 0)
+    _record_usage(entry, data.get("usage") or {})
     return JSONResponse({"input_tokens": entry.input_tokens})
 
 
@@ -466,8 +531,7 @@ async def proxy_messages(request: AnthropicRequest):
                 ),
             )
         anthropic_data = openai_to_anthropic_response(cast(OpenAIStreamChunk, openai_data), request.stop_sequences)
-        entry.input_tokens = anthropic_data["usage"]["input_tokens"]
-        entry.output_tokens = anthropic_data["usage"]["output_tokens"]
+        _record_usage(entry, openai_data.get("usage") or {})
 
         return JSONResponse(
             status_code=200,
@@ -508,20 +572,49 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
     tool_names: dict[int, str] = {}
     late_arg_indexes: set[int] = set()
     finish_reason: str | None = None
-    prompt_tokens = 0
-    completion_tokens = 0
+    done = False
     entry = _current_log()
+    _record_usage(entry, {})
+
+    def closing_events() -> list[str]:
+        events: list[str] = []
+        if open_block_index is not None:
+            events.append(_sse("content_block_stop", build_anthropic_content_block_stop(open_block_index)))
+
+        _logger.debug(
+            "Stream emitted tool_use blocks: %s",
+            " ".join(f"{tool_block_index[i]}:{tool_ids[i]}:{tool_names[i]}" for i in tool_block_index) or "none",
+        )
+        if finish_reason == "content_filter":
+            _logger.warning("Upstream stopped the stream with finish_reason=content_filter")
+        if next_block_index == 0 or finish_reason is None:
+            _logger.warning(
+                "Stream ended with %s and %s",
+                "no content" if next_block_index == 0 else f"{next_block_index} blocks",
+                f"finish_reason={finish_reason}" if finish_reason else "no finish_reason",
+            )
+
+        stop_reason = parse_openai_finish_reason(finish_reason)
+        message_delta = build_anthropic_message_delta(stop_reason, entry.input_tokens or 0, entry.output_tokens or 0)
+        events.append(_sse("message_delta", message_delta))
+        events.append(_sse("message_stop", build_anthropic_stream_stop()))
+        return events
 
     yield _sse("message_start", build_anthropic_stream_start())
 
     try:
         async for line in upstream_response.aiter_lines():
-            if not line or line.startswith(":"):
+            if line.startswith(":"):
+                _record_stream_cost(entry, line)
                 continue
-            if not line.startswith("data: "):
+            if done or not line.startswith("data: "):
                 continue
             data_str = line[6:]
             if data_str == "[DONE]":
+                # Claude Code gets the final events now; the loop only keeps reading for the cost comment.
+                done = True
+                for event in closing_events():
+                    yield event
                 continue
             try:
                 openai_chunk = cast(OpenAIStreamChunk, json.loads(data_str))
@@ -531,8 +624,7 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
 
             chunk_usage = openai_chunk.get("usage") or {}
             if chunk_usage:
-                prompt_tokens = int(chunk_usage.get("prompt_tokens") or 0)
-                completion_tokens = int(chunk_usage.get("completion_tokens") or 0)
+                _record_usage(entry, chunk_usage)
 
             choices = openai_chunk.get("choices", [])
             if not choices:
@@ -615,33 +707,19 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
                         )
                     yield _sse("content_block_delta", build_anthropic_tool_delta(block_idx, partial_json))
 
-        if open_block_index is not None:
-            yield _sse("content_block_stop", build_anthropic_content_block_stop(open_block_index))
-
-        _logger.debug(
-            "Stream emitted tool_use blocks: %s",
-            " ".join(f"{tool_block_index[i]}:{tool_ids[i]}:{tool_names[i]}" for i in tool_block_index) or "none",
-        )
-        if finish_reason == "content_filter":
-            _logger.warning("Upstream stopped the stream with finish_reason=content_filter")
-        if next_block_index == 0 or finish_reason is None:
-            _logger.warning(
-                "Stream ended with %s and %s",
-                "no content" if next_block_index == 0 else f"{next_block_index} blocks",
-                f"finish_reason={finish_reason}" if finish_reason else "no finish_reason",
-            )
-
-        stop_reason = parse_openai_finish_reason(finish_reason)
-        yield _sse("message_delta", build_anthropic_message_delta(stop_reason, prompt_tokens, completion_tokens))
-        yield _sse("message_stop", build_anthropic_stream_stop())
+        if not done:
+            for event in closing_events():
+                yield event
 
     except Exception as exc:
+        if done:
+            _logger.debug("Upstream failed after [DONE], cost not read: %s %r", type(exc).__name__, exc)
+            return
         entry.error = type(exc).__name__
         _log_stream_exception(exc, entry)
         error_payload = build_anthropic_error({"error": {"type": "stream_error", "message": str(exc)}})
         yield _sse("error", error_payload)
     finally:
-        entry.input_tokens, entry.output_tokens = prompt_tokens, completion_tokens
         await upstream_response.aclose()
         await upstream_client.aclose()
 
@@ -654,18 +732,36 @@ def _log_stream_exception(exc: Exception, entry: _RequestLog) -> None:
 
 
 async def _openai_stream_passthrough(upstream_client: httpx.AsyncClient, upstream_response: httpx.Response):
+    entry = _current_log()
+    _record_usage(entry, {})
+    done = False
     try:
         async for line in upstream_response.aiter_lines():
-            if not line or line.startswith(":"):
+            if line.startswith(_COST_COMMENT):
+                _record_stream_cost(entry, line)
+                yield f"{line}\n\n"
                 continue
-            if line.startswith("data: "):
-                data = line[6:]
-                if data == "[DONE]":
-                    continue
-                yield f"data: {data}\n\n"
-        yield "data: [DONE]\n\n"
+            if done or not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                # Sent right away; the loop only keeps reading for the cost comment.
+                done = True
+                yield "data: [DONE]\n\n"
+                continue
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                chunk = None
+            if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
+                _record_usage(entry, chunk["usage"])
+            yield f"data: {data}\n\n"
+        if not done:
+            yield "data: [DONE]\n\n"
     except Exception as exc:
-        entry = _current_log()
+        if done:
+            _logger.debug("Upstream failed after [DONE], cost not read: %s %r", type(exc).__name__, exc)
+            return
         entry.error = type(exc).__name__
         _log_stream_exception(exc, entry)
         yield f"data: {json.dumps({'error': {'message': str(exc)}})}\n\n"
@@ -826,8 +922,7 @@ async def proxy_chat_completions(request: Request):
             _log_invalid_json(response.status_code, response.text)
             raise HTTPException(status_code=502, detail=f"Empty or invalid JSON response (HTTP {response.status_code})")
         _apply_stop_to_chat_completion(openai_data, anthropic_req.stop_sequences)
-        usage = openai_data.get("usage") or {}
-        entry.input_tokens, entry.output_tokens = usage.get("prompt_tokens"), usage.get("completion_tokens")
+        _record_usage(entry, openai_data.get("usage") or {})
         return JSONResponse(status_code=200, content=openai_data)
 
     except httpx.RequestError as exc:
