@@ -15,12 +15,14 @@ from olist_code.models import AdapterConfig, ModelConfig, OpenAIMessage, OpenAIR
 
 
 class _FakeUpstreamResponse:
-    def __init__(self, chunks: list[dict[str, Any]]) -> None:
-        self._lines = [f"data: {json.dumps(c)}" for c in chunks] + ["data: [DONE]"]
+    def __init__(self, chunks: list[dict[str, Any]], trailer: list[str] | None = None) -> None:
+        self._lines = [f"data: {json.dumps(c)}" for c in chunks] + ["data: [DONE]"] + (trailer or [])
+        self.lines_read = 0
         self.closed = False
 
     async def aiter_lines(self):
         for line in self._lines:
+            self.lines_read += 1
             yield line
 
     async def aclose(self) -> None:
@@ -331,7 +333,11 @@ def _post(path: str = "/v1/messages", stream: bool = False, **extra: Any) -> htt
 
 @pytest.fixture
 def upstream(monkeypatch: pytest.MonkeyPatch, config: AdapterConfig) -> dict[str, Any]:
-    state: dict[str, Any] = {"response": _FakeRawResponse(200, json.dumps(_openai_text("ok"))), "chunks": []}
+    state: dict[str, Any] = {
+        "response": _FakeRawResponse(200, json.dumps(_openai_text("ok"))),
+        "chunks": [],
+        "trailer": [],
+    }
 
     async def fake_forward(_config: AdapterConfig, _request_data: dict[str, Any]) -> Any:
         if isinstance(state["response"], Exception):
@@ -339,7 +345,7 @@ def upstream(monkeypatch: pytest.MonkeyPatch, config: AdapterConfig) -> dict[str
         return state["response"]
 
     async def fake_open_stream(_config: AdapterConfig, _request_data: dict[str, Any]) -> Any:
-        return _FakeClient(), _FakeStreamResponse(state["chunks"])
+        return _FakeClient(), _FakeStreamResponse(state["chunks"], state["trailer"])
 
     monkeypatch.setattr(server, "forward_request", fake_forward)
     monkeypatch.setattr(server, "open_upstream_stream", fake_open_stream)
@@ -588,6 +594,249 @@ class TestRequestSummary:
         caplog.set_level(logging.INFO)
 
         TestClient(server.app).get("/health")
+
+        assert _messages(caplog, "olist_code.access", logging.INFO) == []
+
+    def test_summary_has_cost_and_cached_tokens(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        usage = {
+            "prompt_tokens": 3,
+            "completion_tokens": 4,
+            "prompt_tokens_details": {"cached_tokens": 2},
+            "cost": 0.0025,
+        }
+        upstream["response"] = _FakeRawResponse(200, json.dumps({**_openai_text("ok"), "usage": usage}))
+
+        _post()
+
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "in=3 out=4 cached=2 cost=0.002500" in line
+
+    def test_missing_cost_logs_zero(self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO)
+
+        resp = _post()
+
+        assert resp.status_code == 200
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "cached=0 cost=0.000000" in line
+
+    def test_invalid_cost_logs_zero(self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO)
+        usage = {"prompt_tokens": 3, "completion_tokens": 4, "cost": "lots"}
+        upstream["response"] = _FakeRawResponse(200, json.dumps({**_openai_text("ok"), "usage": usage}))
+
+        resp = _post()
+
+        assert resp.status_code == 200
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "cost=0.000000" in line
+
+    def test_count_tokens_summary_has_cost(self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO)
+        upstream["response"] = _FakeRawResponse(200, json.dumps({"usage": {"prompt_tokens": 9, "cost": 0.001}}))
+
+        _post("/v1/messages/count_tokens")
+
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "in=9 out=0" in line
+        assert "cost=0.001000" in line
+
+    def test_stream_summary_has_cost_from_trailing_comment(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        upstream["chunks"] = [_text("hi"), {**_finish("stop"), "usage": {"prompt_tokens": 7, "completion_tokens": 2}}]
+        upstream["trailer"] = [": cost=0.002500", ""]
+
+        resp = _post(stream=True)
+
+        assert "message_stop" in resp.text
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "in=7 out=2" in line
+        assert "cost=0.002500" in line
+
+    def test_stream_without_cost_comment_logs_zero(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        upstream["chunks"] = [_text("hi"), _finish("stop")]
+
+        _post(stream=True)
+
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "cost=0.000000" in line
+
+    def test_chat_completions_stream_summary_has_tokens_and_cost(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        upstream["chunks"] = [_text("hi"), {**_finish("stop"), "usage": {"prompt_tokens": 7, "completion_tokens": 2}}]
+        upstream["trailer"] = [": cost=0.002500", ""]
+
+        resp = _post("/v1/chat/completions", stream=True)
+
+        assert "data: [DONE]" in resp.text
+        assert "cost=" not in resp.text
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "in=7 out=2" in line
+        assert "cost=0.002500" in line
+
+    def test_chat_completions_summary_has_cost(
+        self, upstream: dict[str, Any], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        usage = {"prompt_tokens": 3, "completion_tokens": 4, "cost": 0.5}
+        upstream["response"] = _FakeRawResponse(200, json.dumps({**_openai_text("ok"), "usage": usage}))
+
+        _post("/v1/chat/completions")
+
+        [line] = _messages(caplog, "olist_code.access", logging.INFO)
+        assert "cost=0.500000" in line
+
+
+class TestStreamCost:
+    async def test_message_stop_is_yielded_before_reading_the_cost_comment(self) -> None:
+        upstream = _FakeUpstreamResponse([_text("hi"), _finish("stop")], [": cost=0.002500", ""])
+        lines_before_trailer = len(upstream._lines) - 2
+        token = server._request_log.set(entry := server._RequestLog())
+        try:
+            async for raw in server._stream_response(
+                cast(httpx.AsyncClient, _FakeClient()), cast(httpx.Response, upstream)
+            ):
+                if raw.startswith("event: message_stop"):
+                    assert upstream.lines_read == lines_before_trailer
+        finally:
+            server._request_log.reset(token)
+
+        assert upstream.closed
+        assert entry.cost == 0.0025
+
+    async def test_invalid_cost_comment_is_ignored(self) -> None:
+        upstream = _FakeUpstreamResponse([_text("hi"), _finish("stop")], [": cost=abc"])
+        token = server._request_log.set(entry := server._RequestLog())
+        try:
+            stream = server._stream_response(cast(httpx.AsyncClient, _FakeClient()), cast(httpx.Response, upstream))
+            events = [raw async for raw in stream]
+        finally:
+            server._request_log.reset(token)
+
+        assert events[-1].startswith("event: message_stop")
+        assert entry.error is None
+        assert entry.cost == 0.0
+
+    async def test_failure_after_done_does_not_add_an_error_event(self) -> None:
+        class _DropsAfterDone(_FakeUpstreamResponse):
+            async def aiter_lines(self):
+                async for line in super().aiter_lines():
+                    yield line
+                raise httpx.ReadError("connection reset")
+
+        upstream = _DropsAfterDone([_text("hi"), _finish("stop")])
+        token = server._request_log.set(entry := server._RequestLog())
+        try:
+            stream = server._stream_response(cast(httpx.AsyncClient, _FakeClient()), cast(httpx.Response, upstream))
+            events = [raw async for raw in stream]
+        finally:
+            server._request_log.reset(token)
+
+        assert events[-1].startswith("event: message_stop")
+        assert entry.error is None
+        assert upstream.closed
+
+
+@pytest.fixture(autouse=True)
+def _clear_stats() -> None:
+    server._stats.clear()
+
+
+class TestModelStats:
+    def _stats(self) -> dict[str, Any]:
+        return TestClient(server.app).get("/olist/stats").json()
+
+    def test_accumulates_per_model(self, upstream: dict[str, Any]) -> None:
+        usage = {
+            "prompt_tokens": 3,
+            "completion_tokens": 4,
+            "prompt_tokens_details": {"cached_tokens": 1},
+            "cost": 0.25,
+        }
+        upstream["response"] = _FakeRawResponse(200, json.dumps({**_openai_text("ok"), "usage": usage}))
+
+        _post()
+        _post()
+
+        stats = self._stats()
+        assert "started_at" in stats
+        model = stats["models"]["grok-4.6"]
+        assert model["requests"] == 2
+        assert model["errors"] == 0
+        assert model["input_tokens"] == 6
+        assert model["output_tokens"] == 8
+        assert model["cached_tokens"] == 2
+        assert model["cost"] == 0.5
+        assert model["duration_ms"] >= 0
+
+    def test_splits_by_upstream_model(self, upstream: dict[str, Any]) -> None:
+        _post()
+        _post(model="glm-4.6")
+
+        assert set(self._stats()["models"]) == {"grok-4.6", "glm-4.6"}
+
+    def test_upstream_error_counts_as_error(self, upstream: dict[str, Any]) -> None:
+        upstream["response"] = _FakeRawResponse(429, json.dumps({"detail": "slow down"}))
+
+        _post()
+
+        model = self._stats()["models"]["grok-4.6"]
+        assert model["requests"] == 1
+        assert model["errors"] == 1
+
+    def test_mid_stream_error_counts_as_error(self, upstream: dict[str, Any]) -> None:
+        upstream["chunks"] = [_text("hi"), {"error": {"message": "overloaded"}}]
+
+        _post(stream=True)
+
+        assert self._stats()["models"]["grok-4.6"]["errors"] == 1
+
+    def test_stream_cost_is_counted(self, upstream: dict[str, Any]) -> None:
+        upstream["chunks"] = [_text("hi"), {**_finish("stop"), "usage": {"prompt_tokens": 7, "completion_tokens": 2}}]
+        upstream["trailer"] = [": cost=0.002500", ""]
+
+        _post(stream=True)
+
+        model = self._stats()["models"]["grok-4.6"]
+        assert model["input_tokens"] == 7
+        assert model["cost"] == 0.0025
+
+    def test_chat_completions_traffic_is_counted(self, upstream: dict[str, Any]) -> None:
+        _post("/v1/chat/completions")
+
+        assert self._stats()["models"]["grok-4.6"]["requests"] == 1
+
+    def test_count_tokens_is_counted(self, upstream: dict[str, Any]) -> None:
+        _post("/v1/messages/count_tokens")
+
+        assert self._stats()["models"]["grok-4.6"]["requests"] == 1
+
+    def test_health_and_stats_are_not_counted(self) -> None:
+        client = TestClient(server.app)
+        client.get("/health")
+        client.get("/olist/stats")
+
+        assert self._stats()["models"] == {}
+
+    def test_invalid_request_is_not_counted(self, upstream: dict[str, Any]) -> None:
+        TestClient(server.app).post("/v1/messages", json={"model": "grok-4.6"})
+
+        assert self._stats()["models"] == {}
+
+    def test_stats_endpoint_is_not_logged_at_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO)
+
+        TestClient(server.app).get("/olist/stats")
 
         assert _messages(caplog, "olist_code.access", logging.INFO) == []
 

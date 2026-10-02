@@ -279,3 +279,82 @@ class TestStartGranian:
         assert captured["log_access"] is False
         assert captured["log_level"] == "info"
         assert captured["log_dictconfig"]["root"]["level"] == logging.DEBUG
+
+
+class _FakeStatsResponse:
+    def __init__(self, status_code: int, body: dict | None = None) -> None:
+        self.status_code = status_code
+        self._body = body or {}
+
+    def json(self) -> dict:
+        return self._body
+
+
+class TestUsage:
+    @pytest.fixture
+    def stats_response(self, monkeypatch):
+        state = {"response": _FakeStatsResponse(200, {"started_at": "2026-10-02T12:00:00+00:00", "models": {}})}
+        calls = []
+
+        def fake_get(url, timeout):
+            calls.append(url)
+            if isinstance(state["response"], Exception):
+                raise state["response"]
+            return state["response"]
+
+        monkeypatch.setattr(cli, "load_config", lambda: make_config())
+        monkeypatch.setattr(cli.httpx, "get", fake_get)
+        state["calls"] = calls
+        return state
+
+    def test_prints_rows_and_totals(self, stats_response):
+        model = dict(requests=2, errors=1, input_tokens=1500, output_tokens=300, cached_tokens=1000, duration_ms=4200)
+        stats_response["response"] = _FakeStatsResponse(
+            200,
+            {
+                "started_at": "2026-10-02T12:00:00+00:00",
+                "models": {"glm-4.6": {**model, "cost": 0.25}, "grok-4": {**model, "cost": 0.5}},
+            },
+        )
+
+        result = CliRunner().invoke(cli.cli, ["usage"], terminal_width=200)
+
+        assert result.exit_code == 0, result.output
+        assert stats_response["calls"] == ["http://localhost:3080/olist/stats"]
+        assert "glm-4.6" in result.output
+        assert "grok-4" in result.output
+        assert "Total" in result.output
+        assert "0.2500" in result.output
+        assert "0.7500" in result.output
+        assert "3,000" in result.output
+        assert "2026-10-02" in result.output
+
+    def test_empty_stats(self, stats_response):
+        result = CliRunner().invoke(cli.cli, ["usage"])
+
+        assert result.exit_code == 0, result.output
+        assert "Nenhuma requisição" in result.output
+
+    def test_proxy_down_exits(self, stats_response):
+        stats_response["response"] = cli.httpx.ConnectError("refused")
+
+        result = CliRunner().invoke(cli.cli, ["usage"])
+
+        assert result.exit_code == 1
+        assert "não está respondendo" in result.output
+
+    def test_old_proxy_without_stats_exits(self, stats_response):
+        stats_response["response"] = _FakeStatsResponse(404)
+
+        result = CliRunner().invoke(cli.cli, ["usage"])
+
+        assert result.exit_code == 1
+        assert "reinicie" in result.output.lower()
+
+    def test_proxy_error_status_exits(self, stats_response):
+        stats_response["response"] = _FakeStatsResponse(500)
+
+        result = CliRunner().invoke(cli.cli, ["usage"])
+
+        assert result.exit_code == 1
+        assert "HTTP 500" in result.output

@@ -10,7 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from typing import Annotated, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 import httpx
 import typer
@@ -107,14 +107,16 @@ def _require_config() -> AdapterConfig:
     return cfg
 
 
+def _print_proxy_down(port: int) -> None:
+    console.print(f"[red]O proxy não está respondendo em http://localhost:{port}[/red]")
+    console.print("Rode [bold]olist-code[/bold] (ou [bold]olist-code standalone[/bold]) em outro terminal primeiro.")
+
+
 def _require_proxy(config: AdapterConfig) -> None:
     try:
         httpx.get(f"http://localhost:{config.port}/health", timeout=2.0).raise_for_status()
     except Exception:
-        console.print(f"[red]O proxy não está respondendo em http://localhost:{config.port}[/red]")
-        console.print(
-            "Rode [bold]olist-code[/bold] (ou [bold]olist-code standalone[/bold]) em outro terminal primeiro."
-        )
+        _print_proxy_down(config.port)
         raise typer.Exit(code=1)
 
 
@@ -522,6 +524,53 @@ def config():
             border_style="blue",
         )
     )
+
+
+@cli.command()
+def usage():
+    """Show requests, tokens and cost per model since the proxy started."""
+    cfg = _require_config()
+    try:
+        response = httpx.get(f"http://localhost:{cfg.port}/olist/stats", timeout=2.0)
+    except httpx.HTTPError:
+        _print_proxy_down(cfg.port)
+        raise typer.Exit(code=1)
+    if response.status_code == 404:
+        console.print("[yellow]Esse proxy ainda não mostra o uso.[/yellow]")
+        console.print("Reinicie o [bold]olist-code[/bold] (ou rode [bold]olist-code update[/bold]) e tente de novo.")
+        raise typer.Exit(code=1)
+    if response.status_code != 200:
+        console.print(f"[red]O proxy respondeu com erro (HTTP {response.status_code}) ao buscar o uso.[/red]")
+        raise typer.Exit(code=1)
+
+    stats = response.json()
+    models: dict[str, dict[str, Any]] = stats["models"]
+    if not models:
+        console.print("[yellow]Nenhuma requisição desde que o proxy subiu.[/yellow]")
+        return
+
+    table = Table(title=f"Uso desde {stats['started_at']}")
+    table.add_column("Modelo")
+    for header in ("Reqs", "Erros", "Entrada", "Saída", "Cache", "Custo (US$)", "Tempo"):
+        table.add_column(header, justify="right")
+
+    def row(s: dict[str, Any]) -> list[str]:
+        return [
+            f"{s['requests']:,}",
+            f"{s['errors']:,}",
+            f"{s['input_tokens']:,}",
+            f"{s['output_tokens']:,}",
+            f"{s['cached_tokens']:,}",
+            f"{s['cost']:.4f}",
+            f"{s['duration_ms'] / 1000:,.1f}s",
+        ]
+
+    for name, s in sorted(models.items()):
+        table.add_row(name, *row(s))
+    total = {key: sum(s[key] for s in models.values()) for key in next(iter(models.values()))}
+    table.add_section()
+    table.add_row("Total", *row(total), style="bold")
+    console.print(table)
 
 
 @cli.command()
