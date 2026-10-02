@@ -350,3 +350,11 @@ class TestUsage:
 
         assert result.exit_code == 1
         assert "reinicie" in result.output.lower()
+
+    def test_proxy_error_status_exits(self, stats_response):
+        stats_response["response"] = _FakeStatsResponse(500)
+
+        result = CliRunner().invoke(cli.cli, ["usage"])
+
+        assert result.exit_code == 1
+        assert "HTTP 500" in result.output

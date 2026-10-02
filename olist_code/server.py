@@ -737,9 +737,8 @@ async def _openai_stream_passthrough(upstream_client: httpx.AsyncClient, upstrea
     done = False
     try:
         async for line in upstream_response.aiter_lines():
-            if line.startswith(_COST_COMMENT):
+            if line.startswith(":"):
                 _record_stream_cost(entry, line)
-                yield f"{line}\n\n"
                 continue
             if done or not line.startswith("data: "):
                 continue

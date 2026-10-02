@@ -678,7 +678,8 @@ class TestRequestSummary:
 
         resp = _post("/v1/chat/completions", stream=True)
 
-        assert resp.text.index("data: [DONE]") < resp.text.index(": cost=0.002500")
+        assert "data: [DONE]" in resp.text
+        assert "cost=" not in resp.text
         [line] = _messages(caplog, "olist_code.access", logging.INFO)
         assert "in=7 out=2" in line
         assert "cost=0.002500" in line

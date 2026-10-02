@@ -539,6 +539,9 @@ def usage():
         console.print("[yellow]Esse proxy ainda não mostra o uso.[/yellow]")
         console.print("Reinicie o [bold]olist-code[/bold] (ou rode [bold]olist-code update[/bold]) e tente de novo.")
         raise typer.Exit(code=1)
+    if response.status_code != 200:
+        console.print(f"[red]O proxy respondeu com erro (HTTP {response.status_code}) ao buscar o uso.[/red]")
+        raise typer.Exit(code=1)
 
     stats = response.json()
     models: dict[str, dict[str, Any]] = stats["models"]
