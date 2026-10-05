@@ -53,6 +53,7 @@ Tudo depois do nome do harness vai direto pra ele: `olist-code claude --resume`.
 | `olist-code login` | Sign in with the backoffice SSO; the token is used as the gateway API key. |
 | `olist-code logout` | Remove the stored SSO tokens. |
 | `olist-code config` | Print the saved olist-code config (base URL, port, models, masked API key). |
+| `olist-code usage` | Show requests, tokens and cost per model since the proxy started. |
 | `olist-code restore` | Undo everything olist-code wrote to Claude Code / opencode settings and remove the local config. |
 | `olist-code version` | Print the installed olist-code version. |
 
