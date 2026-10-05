@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
+from collections import Counter
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import httpx
@@ -29,6 +33,7 @@ from .adapter import (
 )
 from .auth import AuthError
 from .config import claude_family_models, load_config
+from .logging_setup import request_id
 from .models import (
     AdapterConfig,
     AnthropicContentBlock,
@@ -39,6 +44,8 @@ from .models import (
     JsonDict,
     OpenAIChatCompletionsRequest,
     OpenAIChoiceChunk,
+    OpenAIMessage,
+    OpenAIRole,
     OpenAIStreamChunk,
     OpenAIToolDef,
 )
@@ -98,23 +105,230 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
 _access_logger = logging.getLogger("olist_code.access")
 
+_UPSTREAM_PATH = "/v1/chat/completions"
+_ERROR_BODY_LIMIT = 2000
+_INVALID_JSON_LIMIT = 500
+_SHAPE_DETAILED_MESSAGES = 10
+_TOOL_IDS_LISTED = 8
+_TOOL_ORPHANS_LISTED = 3
 
-@app.middleware("http")
-async def log_user_agent(request: Request, call_next):
-    response = await call_next(request)
-    user_agent = request.headers.get("user-agent", "-")
-    _access_logger.info(
-        '"%s %s HTTP/%s" %s user-agent=%r',
-        request.method,
-        request.url.path,
-        request.scope.get("http_version", "1.1"),
-        response.status_code,
-        user_agent,
+
+@dataclass
+class _RequestLog:
+    started: float = field(default_factory=time.monotonic)
+    body_bytes: int | None = None
+    model: str | None = None
+    upstream_model: str | None = None
+    stream: bool = False
+    request: AnthropicRequest | None = None
+    upstream_messages: int | None = None
+    upstream_history: list[OpenAIMessage] | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    error: str | None = None
+
+    def elapsed_ms(self) -> int:
+        return int((time.monotonic() - self.started) * 1000)
+
+    def shape(self) -> str:
+        if self.request is None:
+            return f"body={self.body_bytes}B"
+        return _request_shape(self.request, self.body_bytes, self.upstream_messages)
+
+
+_request_log: ContextVar[_RequestLog | None] = ContextVar("olist_code_request_log", default=None)
+
+
+def _current_log() -> _RequestLog:
+    """The log entry of the request being served; a throwaway one outside a request."""
+    return _request_log.get() or _RequestLog()
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else f"{text[:limit]}…(+{len(text) - limit} chars)"
+
+
+def _format_counts(counts: Counter[str]) -> str:
+    return ",".join(f"{block_type}×{n}" for block_type, n in counts.items())
+
+
+def _block_counts(message: AnthropicMessage) -> Counter[str]:
+    if isinstance(message.content, str):
+        return Counter({"text": 1})
+    return Counter(str(block.get("type", "?")) for block in message.content)
+
+
+def _request_shape(
+    request: AnthropicRequest, body_bytes: int | None = None, upstream_messages: int | None = None
+) -> str:
+    """Structure of a request for error logs: roles and block types only, never text, tool inputs or headers."""
+    counts = [_block_counts(m) for m in request.messages]
+    parts = [f"msgs={len(request.messages)}"]
+    if len(request.messages) > _SHAPE_DETAILED_MESSAGES:
+        parts.append(f"blocks[{_format_counts(sum(counts, Counter()))}] last{_SHAPE_DETAILED_MESSAGES}:")
+    recent = zip(request.messages[-_SHAPE_DETAILED_MESSAGES:], counts[-_SHAPE_DETAILED_MESSAGES:])
+    parts.extend(f"{m.role.value}[{_format_counts(c)}]" for m, c in recent)
+    system = request.system
+    parts.append(f"system={0 if not system else 1 if isinstance(system, str) else len(system)}")
+    parts.append(f"tools={len(request.tools or [])}")
+    parts.append(f"max_tokens={request.max_tokens}")
+    parts.append(f"stream={'yes' if request.stream else 'no'}")
+    if body_bytes is not None:
+        parts.append(f"body={body_bytes}B")
+    if upstream_messages is not None:
+        parts.append(f"upstream_msgs={upstream_messages}")
+    return " ".join(parts)
+
+
+def _id_list(ids: list[str], limit: int = _TOOL_IDS_LISTED) -> str:
+    listed = ",".join(ids[:limit])
+    return f"{listed},…(+{len(ids) - limit})" if len(ids) > limit else listed
+
+
+def _tool_id_check(messages: list[OpenAIMessage]) -> str:
+    """Tool call/result pairing of the messages sent upstream, ids only.
+
+    A tool message must answer a call of the assistant message opening its run of tool messages.
+    """
+    orphans: list[str] = []
+    unanswered: list[str] = []
+    call_counts: Counter[str] = Counter()
+    run_position: int | None = None
+    run_calls: list[str] = []
+    run_results: list[str] = []
+    last_run = ""
+    last_results: list[str] = []
+
+    def close_run() -> None:
+        missing = [i for i in run_calls if i not in run_results]
+        if missing:
+            unanswered.append(f"unanswered@{run_position}[{_id_list(missing)}]")
+
+    for position, message in enumerate(messages):
+        if message.role == OpenAIRole.tool:
+            tool_call_id = str(message.tool_call_id)
+            run_results.append(tool_call_id)
+            if tool_call_id not in run_calls:
+                orphans.append(f"orphan@{position}:{tool_call_id} avail[{_id_list(run_calls)}]")
+            continue
+        close_run()
+        run_results = []
+        if message.role == OpenAIRole.assistant and message.tool_calls:
+            run_position, run_calls = position, [c.id for c in message.tool_calls]
+            call_counts.update(run_calls)
+            last_run, last_results = f"last_calls@{position}[{_id_list(run_calls)}]", run_results
+        else:
+            run_position, run_calls = None, []
+    close_run()
+
+    problems = orphans[:_TOOL_ORPHANS_LISTED]
+    if len(orphans) > _TOOL_ORPHANS_LISTED:
+        problems.append(f"orphans+{len(orphans) - _TOOL_ORPHANS_LISTED}")
+    duplicates = [f"{i}×{n}" for i, n in call_counts.items() if n > 1]
+    if duplicates:
+        problems.append(f"dup[{_id_list(duplicates)}]")
+    problems.extend(unanswered[:_TOOL_ORPHANS_LISTED])
+    parts = [f"tool_ids={' '.join(problems)}" if problems else "tool_ids=ok"]
+    if last_run:
+        parts.append(f"{last_run} results[{_id_list(last_results)}]")
+    return " ".join(parts)
+
+
+def _log_upstream_status(entry: _RequestLog, status: int, body: str) -> None:
+    tool_ids = f" {_tool_id_check(entry.upstream_history)}" if entry.upstream_history is not None else ""
+    _logger.warning(
+        "Upstream returned HTTP %s for upstream_model=%s: %s | %s%s",
+        status,
+        entry.upstream_model,
+        _truncate(body, _ERROR_BODY_LIMIT) or "<empty body>",
+        entry.shape(),
+        tool_ids,
     )
-    return response
+
+
+def _log_invalid_json(status: int, body: str) -> None:
+    _logger.warning(
+        "Upstream returned HTTP %s with empty or invalid JSON: %r",
+        status,
+        _truncate(body, _INVALID_JSON_LIMIT),
+    )
+
+
+def _log_request_error(entry: _RequestLog, exc: httpx.RequestError) -> None:
+    _logger.warning(
+        "Upstream request failed: %s %r upstream=%s after %dms | %s",
+        type(exc).__name__,
+        exc,
+        _UPSTREAM_PATH,
+        entry.elapsed_ms(),
+        entry.shape(),
+    )
+
+
+def _log_summary(method: str, path: str, status: int, entry: _RequestLog) -> None:
+    parts = [f"{method} {path}"]
+    if entry.model:
+        model = entry.model
+        if entry.upstream_model and entry.upstream_model != entry.model:
+            model = f"{model}→{entry.upstream_model}"
+        parts.append(f"model={model} stream={'yes' if entry.stream else 'no'}")
+    parts.append(f"status={status}")
+    if entry.error:
+        parts.append(f"error={entry.error}")
+    parts.append(f"{entry.elapsed_ms()}ms")
+    if entry.input_tokens is not None or entry.output_tokens is not None:
+        parts.append(f"in={entry.input_tokens or 0} out={entry.output_tokens or 0}")
+    if path == "/health":
+        level = logging.DEBUG
+    elif status >= 400 or entry.error:
+        level = logging.WARNING
+    else:
+        level = logging.INFO
+    _access_logger.log(level, " ".join(parts))
+
+
+class _RequestLogMiddleware:
+    """Tags every log line with a request id and emits one summary line once the response is fully sent.
+
+    A plain ASGI middleware, so for streams the summary waits until the stream ends.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        content_length = headers.get("content-length", "")
+        entry = _RequestLog(body_bytes=int(content_length) if content_length.isdigit() else None)
+        status = 500
+        id_token = request_id.set(uuid.uuid4().hex[:6])
+        log_token = _request_log.set(entry)
+        _access_logger.debug("%s %s user-agent=%r", scope["method"], scope["path"], headers.get("user-agent", "-"))
+
+        async def send_with_status(message: Any) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_status)
+        except Exception:
+            _logger.exception("Unhandled error | %s", entry.shape())
+            raise
+        finally:
+            _log_summary(scope["method"], scope["path"], status, entry)
+            _request_log.reset(log_token)
+            request_id.reset(id_token)
+
+
+app.add_middleware(_RequestLogMiddleware)
 
 
 @app.exception_handler(AuthError)
@@ -138,16 +352,22 @@ async def count_tokens(request: AnthropicRequest):
     if config is None:
         raise HTTPException(status_code=503, detail="Adapter not configured.")
 
+    entry = _current_log()
+    entry.model, entry.request = request.model, request
     await _reroute_unknown_claude_model(request, config)
+    entry.upstream_model = request.model
     openai_request = anthropic_to_openai(request, config)
+    entry.upstream_messages, entry.upstream_history = len(openai_request.messages), openai_request.messages
     request_data = {**openai_request.model_dump(exclude_none=True), "max_completion_tokens": 1, "stream": False}
 
     try:
         response = await forward_request(config, request_data)
     except httpx.RequestError as exc:
+        _log_request_error(entry, exc)
         return JSONResponse(status_code=502, content=build_anthropic_error({"error": {"type": "upstream_error", "message": str(exc)}}))
 
     if response.status_code != 200:
+        _log_upstream_status(entry, response.status_code, response.text)
         try:
             err: dict[str, object] = response.json()
         except Exception:
@@ -157,10 +377,12 @@ async def count_tokens(request: AnthropicRequest):
     try:
         data = response.json()
     except Exception:
+        _log_invalid_json(response.status_code, response.text)
         return JSONResponse(status_code=502, content=build_anthropic_error({"error": {"type": "upstream_error", "message": "Invalid JSON from upstream"}}))
 
     usage = data.get("usage") or {}
-    return JSONResponse({"input_tokens": int(usage.get("prompt_tokens") or 0)})
+    entry.input_tokens = int(usage.get("prompt_tokens") or 0)
+    return JSONResponse({"input_tokens": entry.input_tokens})
 
 
 @app.post("/v1/messages")
@@ -172,9 +394,13 @@ async def proxy_messages(request: AnthropicRequest):
             detail="Adapter not configured. Run --init first.",
         )
 
+    entry = _current_log()
+    entry.model, entry.request, entry.stream = request.model, request, request.stream
     await _reroute_unknown_claude_model(request, config)
+    entry.upstream_model = request.model
     try:
         openai_request = anthropic_to_openai(request, config)
+        entry.upstream_messages, entry.upstream_history = len(openai_request.messages), openai_request.messages
         request_data = openai_request.model_dump(exclude_none=True)
 
         if request.stream:
@@ -183,6 +409,7 @@ async def proxy_messages(request: AnthropicRequest):
                 error_text = await upstream_response.aread()
                 await upstream_response.aclose()
                 await upstream_client.aclose()
+                _log_upstream_status(entry, upstream_response.status_code, error_text.decode(errors="replace"))
                 try:
                     error_body_raw: dict[str, object] = json.loads(error_text)
                 except Exception:
@@ -209,6 +436,7 @@ async def proxy_messages(request: AnthropicRequest):
         response = await forward_request(config, request_data)
 
         if response.status_code != 200:
+            _log_upstream_status(entry, response.status_code, response.text)
             try:
                 error_body_raw: dict[str, object] = response.json()
             except Exception:
@@ -223,6 +451,7 @@ async def proxy_messages(request: AnthropicRequest):
         try:
             openai_data = response.json()
         except Exception:
+            _log_invalid_json(response.status_code, response.text)
             return JSONResponse(
                 status_code=502,
                 content=build_anthropic_error(
@@ -237,6 +466,8 @@ async def proxy_messages(request: AnthropicRequest):
                 ),
             )
         anthropic_data = openai_to_anthropic_response(cast(OpenAIStreamChunk, openai_data), request.stop_sequences)
+        entry.input_tokens = anthropic_data["usage"]["input_tokens"]
+        entry.output_tokens = anthropic_data["usage"]["output_tokens"]
 
         return JSONResponse(
             status_code=200,
@@ -250,12 +481,14 @@ async def proxy_messages(request: AnthropicRequest):
         )
 
     except httpx.HTTPStatusError as e:
+        _log_upstream_status(entry, e.response.status_code, e.response.text)
         error_body: dict[str, object] = {"error": {"type": "upstream_error", "message": str(e)}}
         return JSONResponse(
             status_code=e.response.status_code,
             content=build_anthropic_error(error_body),
         )
     except httpx.RequestError as e:
+        _log_request_error(entry, e)
         return JSONResponse(
             status_code=502,
             content=build_anthropic_error({"error": {"type": "upstream_error", "message": str(e)}}),
@@ -271,9 +504,13 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
     open_block_index: int | None = None
     text_block_index: int | None = None
     tool_block_index: dict[int, int] = {}
+    tool_ids: dict[int, str] = {}
+    tool_names: dict[int, str] = {}
+    late_arg_indexes: set[int] = set()
     finish_reason: str | None = None
     prompt_tokens = 0
     completion_tokens = 0
+    entry = _current_log()
 
     yield _sse("message_start", build_anthropic_stream_start())
 
@@ -289,6 +526,7 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
             try:
                 openai_chunk = cast(OpenAIStreamChunk, json.loads(data_str))
             except json.JSONDecodeError:
+                _logger.debug("Skipping non-JSON stream line: %r", _truncate(data_str, 200))
                 continue
 
             chunk_usage = openai_chunk.get("usage") or {}
@@ -298,6 +536,12 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
 
             choices = openai_chunk.get("choices", [])
             if not choices:
+                if "error" in openai_chunk:
+                    entry.error = "upstream_error"
+                    _logger.warning(
+                        "Upstream sent an error inside the stream: %s",
+                        _truncate(json.dumps(openai_chunk["error"]), _ERROR_BODY_LIMIT),
+                    )
                 continue
 
             choice: OpenAIChoiceChunk = choices[0]
@@ -322,6 +566,23 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
                 func = tc.get("function", {})
                 tc_id = tc.get("id")
 
+                if tc_id:
+                    other_index = next((i for i, known in tool_ids.items() if known == tc_id and i != tc_index), None)
+                    if other_index is not None:
+                        _logger.warning(
+                            "Stream tool call id %s at index %d already used at index %d",
+                            tc_id,
+                            tc_index,
+                            other_index,
+                        )
+                    elif tc_index in tool_ids and tool_ids[tc_index] != tc_id:
+                        _logger.warning(
+                            "Stream tool call at index %d changed id from %s to %s",
+                            tc_index,
+                            tool_ids[tc_index],
+                            tc_id,
+                        )
+
                 if tc_index not in tool_block_index:
                     if open_block_index is not None:
                         yield _sse("content_block_stop", build_anthropic_content_block_stop(open_block_index))
@@ -329,33 +590,67 @@ async def _stream_response(upstream_client: httpx.AsyncClient, upstream_response
                     block_idx = open_block_index = next_block_index
                     next_block_index += 1
                     tool_block_index[tc_index] = block_idx
+                    if not tc_id:
+                        tc_id = f"toolu_{uuid.uuid4().hex[:24]}"
+                        _logger.warning(
+                            "Stream tool call at index %d started without an id, generated %s", tc_index, tc_id
+                        )
+                    tool_ids[tc_index] = tc_id
+                    tool_names[tc_index] = func.get("name", "unknown_tool")
                     yield _sse(
                         "content_block_start",
-                        build_anthropic_content_block_start_tool(
-                            block_idx,
-                            tc_id or f"toolu_{uuid.uuid4().hex[:24]}",
-                            func.get("name", "unknown_tool"),
-                        ),
+                        build_anthropic_content_block_start_tool(block_idx, tc_id, tool_names[tc_index]),
                     )
 
                 block_idx = tool_block_index[tc_index]
                 partial_json = func.get("arguments", "")
                 if partial_json:
+                    # Still emitted to the closed block, as before; logged once per index to spot interleaved calls.
+                    if block_idx != open_block_index and tc_index not in late_arg_indexes:
+                        late_arg_indexes.add(tc_index)
+                        _logger.warning(
+                            "Stream argument delta for tool index %d arrived after its block %d was closed",
+                            tc_index,
+                            block_idx,
+                        )
                     yield _sse("content_block_delta", build_anthropic_tool_delta(block_idx, partial_json))
 
         if open_block_index is not None:
             yield _sse("content_block_stop", build_anthropic_content_block_stop(open_block_index))
+
+        _logger.debug(
+            "Stream emitted tool_use blocks: %s",
+            " ".join(f"{tool_block_index[i]}:{tool_ids[i]}:{tool_names[i]}" for i in tool_block_index) or "none",
+        )
+        if finish_reason == "content_filter":
+            _logger.warning("Upstream stopped the stream with finish_reason=content_filter")
+        if next_block_index == 0 or finish_reason is None:
+            _logger.warning(
+                "Stream ended with %s and %s",
+                "no content" if next_block_index == 0 else f"{next_block_index} blocks",
+                f"finish_reason={finish_reason}" if finish_reason else "no finish_reason",
+            )
 
         stop_reason = parse_openai_finish_reason(finish_reason)
         yield _sse("message_delta", build_anthropic_message_delta(stop_reason, prompt_tokens, completion_tokens))
         yield _sse("message_stop", build_anthropic_stream_stop())
 
     except Exception as exc:
+        entry.error = type(exc).__name__
+        _log_stream_exception(exc, entry)
         error_payload = build_anthropic_error({"error": {"type": "stream_error", "message": str(exc)}})
         yield _sse("error", error_payload)
     finally:
+        entry.input_tokens, entry.output_tokens = prompt_tokens, completion_tokens
         await upstream_response.aclose()
         await upstream_client.aclose()
+
+
+def _log_stream_exception(exc: Exception, entry: _RequestLog) -> None:
+    if isinstance(exc, httpx.HTTPError):
+        _logger.warning("Stream failed after %dms: %s %r", entry.elapsed_ms(), type(exc).__name__, exc)
+    else:
+        _logger.exception("Stream failed after %dms | %s", entry.elapsed_ms(), entry.shape())
 
 
 async def _openai_stream_passthrough(upstream_client: httpx.AsyncClient, upstream_response: httpx.Response):
@@ -370,6 +665,9 @@ async def _openai_stream_passthrough(upstream_client: httpx.AsyncClient, upstrea
                 yield f"data: {data}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as exc:
+        entry = _current_log()
+        entry.error = type(exc).__name__
+        _log_stream_exception(exc, entry)
         yield f"data: {json.dumps({'error': {'message': str(exc)}})}\n\n"
     finally:
         await upstream_response.aclose()
@@ -476,8 +774,12 @@ async def proxy_chat_completions(request: Request):
         stop_sequences=body.get("stop") if isinstance(body.get("stop"), list) else None,
     )
 
+    entry = _current_log()
+    entry.model = entry.upstream_model = anthropic_req.model
+    entry.request, entry.stream = anthropic_req, anthropic_req.stream
     try:
         openai_request = anthropic_to_openai(anthropic_req, config)
+        entry.upstream_messages = len(openai_request.messages)
         request_data = openai_request.model_dump(exclude_none=True)
 
         if anthropic_req.stream:
@@ -486,6 +788,7 @@ async def proxy_chat_completions(request: Request):
                 error_text = await upstream_response.aread()
                 await upstream_response.aclose()
                 await upstream_client.aclose()
+                _log_upstream_status(entry, upstream_response.status_code, error_text.decode(errors="replace"))
                 try:
                     resp_content: dict[str, object] = json.loads(error_text)
                 except Exception:
@@ -508,6 +811,7 @@ async def proxy_chat_completions(request: Request):
         response = await forward_request(config, request_data)
 
         if response.status_code != 200:
+            _log_upstream_status(entry, response.status_code, response.text)
             try:
                 resp_content = response.json()
             except Exception:
@@ -519,11 +823,15 @@ async def proxy_chat_completions(request: Request):
         try:
             openai_data = response.json()
         except Exception:
+            _log_invalid_json(response.status_code, response.text)
             raise HTTPException(status_code=502, detail=f"Empty or invalid JSON response (HTTP {response.status_code})")
         _apply_stop_to_chat_completion(openai_data, anthropic_req.stop_sequences)
+        usage = openai_data.get("usage") or {}
+        entry.input_tokens, entry.output_tokens = usage.get("prompt_tokens"), usage.get("completion_tokens")
         return JSONResponse(status_code=200, content=openai_data)
 
     except httpx.RequestError as exc:
+        _log_request_error(entry, exc)
         raise HTTPException(status_code=502, detail=str(exc))
 
 

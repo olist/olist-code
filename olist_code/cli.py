@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import socket
@@ -35,6 +36,7 @@ from .config import (
     update_claude_settings,
     update_opencode_settings,
 )
+from .logging_setup import LOG_FILE, build_log_config, granian_log_level, resolve_log_level
 from .models import AdapterConfig, ModelConfig, SSOConfig
 from .proxy import fetch_gateway_models
 
@@ -245,22 +247,48 @@ _HARNESS_OPTION = Annotated[
     str | None,
     typer.Option("--harness", help="Which harness to configure: claude, opencode, or both"),
 ]
+_LOG_LEVEL_OPTION = Annotated[
+    str | None,
+    typer.Option("--log-level", help="debug, info, warning or error (default: $OLIST_CODE_LOG_LEVEL or info)"),
+]
+_DEBUG_OPTION = Annotated[bool, typer.Option("--debug", help="Shortcut for --log-level debug")]
+
+
+def _resolve_log_level(log_level: str | None, debug: bool) -> int:
+    try:
+        return resolve_log_level(log_level, debug)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+
+
 @cli.callback(invoke_without_command=True)
-def main_default(ctx: typer.Context, port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
+def main_default(
+    ctx: typer.Context,
+    port: _PORT_OPTION = None,
+    harness: _HARNESS_OPTION = None,
+    log_level: _LOG_LEVEL_OPTION = None,
+    debug: _DEBUG_OPTION = False,
+):
     """Start the proxy: logs in and picks a model automatically the first time, then reuses the saved config."""
     if ctx.invoked_subcommand is not None:
         return
-    _run_server(port, harness, isolated=False)
+    _run_server(port, harness, isolated=False, log_level=_resolve_log_level(log_level, debug))
 
 
 @cli.command("standalone")
-def standalone_command(port: _PORT_OPTION = None, harness: _HARNESS_OPTION = None):
+def standalone_command(
+    port: _PORT_OPTION = None,
+    harness: _HARNESS_OPTION = None,
+    log_level: _LOG_LEVEL_OPTION = None,
+    debug: _DEBUG_OPTION = False,
+):
     """Start the proxy without touching the global Claude Code settings.
 
     A plain `claude` keeps using your own Anthropic account; reach the gateway with
     `olist-code claude` instead. Also undoes what a previous plain `olist-code` wrote.
     """
-    _run_server(port, harness, isolated=True)
+    _run_server(port, harness, isolated=True, log_level=_resolve_log_level(log_level, debug))
 
 
 @cli.command(
@@ -287,7 +315,7 @@ def opencode_command(ctx: typer.Context):
     _launch("opencode", ctx.args)
 
 
-def _run_server(port: int | None, harness: str | None, isolated: bool) -> None:
+def _run_server(port: int | None, harness: str | None, isolated: bool, log_level: int = logging.INFO) -> None:
     existing = load_config()
 
     if not (existing and existing.api_key) and load_tokens() is None:
@@ -355,6 +383,7 @@ def _run_server(port: int | None, harness: str | None, isolated: bool) -> None:
             + f"  Models:    opus={config.models.opus}, "
             + f"sonnet={config.models.sonnet or '—'}, "
             + f"haiku={config.models.haiku or '—'}\n"
+            + f"  Logs:      {LOG_FILE} ({logging.getLevelName(log_level).lower()})\n"
             + "  Claude:    "
             + (
                 "standalone — abra com `olist-code claude`"
@@ -367,7 +396,7 @@ def _run_server(port: int | None, harness: str | None, isolated: bool) -> None:
     )
     console.print()
 
-    _start_granian(config)
+    _start_granian(config, log_level)
 
 
 def _ensure_port_free(port: int) -> None:
@@ -388,7 +417,7 @@ def _ensure_port_free(port: int) -> None:
             raise typer.Exit(code=1)
 
 
-def _start_granian(config: AdapterConfig) -> None:
+def _start_granian(config: AdapterConfig, log_level: int = logging.INFO) -> None:
     try:
         from granian import Granian
         from granian.constants import Interfaces
@@ -408,8 +437,9 @@ def _start_granian(config: AdapterConfig) -> None:
         port=config.port,
         workers=1,
         interface=Interfaces.ASGI,
-        log_level=LogLevels.info,
-        log_access=True,
+        log_level=LogLevels(granian_log_level(log_level)),
+        log_dictconfig=build_log_config(log_level, LOG_FILE),
+        log_access=False,
     )
     server.serve()
 

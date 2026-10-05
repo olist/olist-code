@@ -2,6 +2,7 @@
 
 import os
 
+from olist_code.logging_setup import build_log_config, granian_log_level, resolve_log_level
 from olist_code.models import AdapterConfig, ModelConfig
 from olist_code.server import set_app_config
 
@@ -24,12 +25,14 @@ if __name__ == "__main__":
     from granian.constants import Interfaces
     from granian.log import LogLevels
 
+    log_level = resolve_log_level(None, debug=False)
     Granian(
         "olist_code.server:app",
         address="0.0.0.0",
         port=config.port,
         workers=1,
         interface=Interfaces.ASGI,
-        log_level=LogLevels.info,
-        log_access=True,
+        log_level=LogLevels(granian_log_level(log_level)),
+        log_dictconfig=build_log_config(log_level, log_file=None),
+        log_access=False,
     ).serve()

@@ -79,6 +79,7 @@ def _parse_content_for_message(
 def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> OpenAIRequest:
     system_parts: list[str] = []
     other_messages: list[_OpenAIMessageDict] = []
+    last_tool_call_ids: list[str] = []
 
     if request.system:
         if isinstance(request.system, str):
@@ -101,6 +102,7 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
                 other_messages.append(_OpenAIMessageDict(role="user", content=content))
             else:
                 non_tool_blocks: list[AnthropicContentBlock] = []
+                tool_messages: list[_OpenAIMessageDict] = []
                 for block in content:
                     if block.get("type") == "tool_result":
                         result_text: str
@@ -113,7 +115,7 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
                             )
                         else:
                             result_text = ""
-                        other_messages.append(
+                        tool_messages.append(
                             _OpenAIMessageDict(
                                 role="tool",
                                 content=result_text,
@@ -122,6 +124,11 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
                         )
                     else:
                         non_tool_blocks.append(block)
+
+                # Upstream rejects tool results not in the same order as the preceding tool_calls.
+                call_order = {call_id: i for i, call_id in enumerate(last_tool_call_ids)}
+                tool_messages.sort(key=lambda m: call_order.get(str(m.get("tool_call_id")), len(call_order)))
+                other_messages.extend(tool_messages)
 
                 if non_tool_blocks:
                     other_messages.append(
@@ -148,6 +155,7 @@ def anthropic_to_openai(request: AnthropicRequest, _config: AdapterConfig) -> Op
                         )
                         for block in tool_use_blocks
                     ]
+                    last_tool_call_ids = [call.id for call in tool_calls]
                     other_messages.append(
                         _OpenAIMessageDict(
                             role="assistant",

@@ -22,6 +22,7 @@ from olist_code.adapter import (
 )
 from olist_code.models import (
     AdapterConfig,
+    AnthropicContentBlock,
     AnthropicInputJsonDeltaDict,
     AnthropicMessage,
     AnthropicRequest,
@@ -367,6 +368,63 @@ class TestAnthropicToOpenaiWithToolResult:
         assert result.messages[2].role == "tool"
         assert result.messages[2].tool_call_id == "toolu_01abc123"
         assert result.messages[2].content == '{"status": "shipped", "tracking": "BR123456789"}'
+
+
+def _tool_round_request(
+    call_ids: list[str], result_ids: list[str], trailing_text: str | None = None
+) -> AnthropicRequest:
+    results: list[AnthropicContentBlock] = [
+        {"type": "tool_result", "tool_use_id": rid, "content": f"result {rid}"} for rid in result_ids
+    ]
+    if trailing_text is not None:
+        results.append({"type": "text", "text": trailing_text})
+    return AnthropicRequest(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[
+            AnthropicMessage(role=AnthropicRole.user, content="go"),
+            AnthropicMessage(
+                role=AnthropicRole.assistant,
+                content=[{"type": "tool_use", "id": cid, "name": "t", "input": {}} for cid in call_ids],
+            ),
+            AnthropicMessage(role=AnthropicRole.user, content=results),
+        ],
+    )
+
+
+def _tool_ids(request: AnthropicRequest, config: AdapterConfig) -> list[str | None]:
+    result = anthropic_to_openai(request, config)
+    return [m.tool_call_id for m in result.messages if m.role == "tool"]
+
+
+class TestAnthropicToOpenaiToolResultOrder:
+    def test_reversed_results_follow_tool_calls_order(self, config: AdapterConfig) -> None:
+        req = _tool_round_request(["a", "b"], ["b", "a"])
+        assert _tool_ids(req, config) == ["a", "b"]
+
+    def test_shuffled_results_follow_tool_calls_order(self, config: AdapterConfig) -> None:
+        req = _tool_round_request(["a", "b", "c", "d", "e", "f"], ["d", "a", "f", "c", "e", "b"])
+        assert _tool_ids(req, config) == ["a", "b", "c", "d", "e", "f"]
+
+    def test_unknown_result_ids_kept_after_matched(self, config: AdapterConfig) -> None:
+        req = _tool_round_request(["a", "b"], ["x", "b", "y", "a"])
+        assert _tool_ids(req, config) == ["a", "b", "x", "y"]
+
+    def test_ordered_results_unchanged(self, config: AdapterConfig) -> None:
+        req = _tool_round_request(["a", "b", "c"], ["a", "b", "c"])
+        result = anthropic_to_openai(req, config)
+        tools = [m for m in result.messages if m.role == "tool"]
+        assert [m.tool_call_id for m in tools] == ["a", "b", "c"]
+        assert [m.content for m in tools] == ["result a", "result b", "result c"]
+
+    def test_user_text_stays_after_reordered_results(self, config: AdapterConfig) -> None:
+        req = _tool_round_request(["a", "b"], ["b", "a"], trailing_text="next")
+        result = anthropic_to_openai(req, config)
+        tail = result.messages[-3:]
+        assert [m.role for m in tail] == ["tool", "tool", "user"]
+        assert [m.tool_call_id for m in tail[:2]] == ["a", "b"]
+        assert [m.content for m in tail[:2]] == ["result a", "result b"]
+        assert tail[2].content == "next"
 
 
 # ── Streaming: text ──────────────────────────────────────────────────────────
